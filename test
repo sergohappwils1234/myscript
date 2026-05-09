@@ -1,0 +1,862 @@
+-- =====================================================================
+-- ⚔️ TOWER DEFENSE MACRO V26 (Source-Code Edition)
+-- Built directly from the game's internal UI Handler dumps.
+-- Features:
+-- 1. Dynamic ID Resolver (Trade to alts, different slots = works perfectly)
+-- 2. Strict Failure Tracking (Skips stolen spots, continues macro)
+-- 3. Auto-Max Post-Macro Engine (Refinds and maxes all placed towers)
+-- =====================================================================
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+setfpscap(15)
+game:GetService("RunService").Heartbeat:Connect(function() setfpscap(15) end)
+
+local Players = game:GetService("Players")
+local LP = Players.LocalPlayer or Players.PlayerAdded:Wait()
+local RS = game:GetService("ReplicatedStorage")
+local HTTP = game:GetService("HttpService")
+local UIS = game:GetService("UserInputService")
+
+-- Anti-AFK
+local VU = game:GetService("VirtualUser")
+LP.Idled:Connect(function()
+    pcall(function()
+        VU:Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+        task.wait(1)
+        VU:Button2Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+    end)
+end)
+
+-- ==================== DIRECTORIES & SAVING ====================
+local FOLDER = "TowerMacro"
+local MACRO_FOLDER = FOLDER .. "/macros"
+local SETTINGS_FILE = FOLDER .. "/" .. LP.Name .. "_settings.json"
+local LOG_FILE = FOLDER .. "/" .. LP.Name .. "_log.txt"
+
+pcall(function()
+    if not isfolder(FOLDER) then makefolder(FOLDER) end
+    if not isfolder(MACRO_FOLDER) then makefolder(MACRO_FOLDER) end
+end)
+
+local function saveJSON(path, data) pcall(function() writefile(path, HTTP:JSONEncode(data)) end) end
+local function loadJSON(path)
+    if not isfile(path) then return nil end
+    local s, r = pcall(function() return HTTP:JSONDecode(readfile(path)) end)
+    return s and r or nil
+end
+
+local DEFAULTS = {
+    autoReady = false, autoSkip = false, autoSpeed = false, 
+    autoReplay = false, autoPlay = false, autoMax = false, gamemode = "Extreme", macroName = ""
+}
+local S = loadJSON(SETTINGS_FILE) or {}
+for k, v in pairs(DEFAULTS) do if S[k] == nil then S[k] = v end end
+
+S.recording = false; S.replaying = false; S.macro = nil
+S.macroPlayed = false; S.gameEndHandled = false; S.readyFired = false
+
+local function saveS()
+    local t = {}; for k in pairs(DEFAULTS) do t[k] = S[k] end
+    saveJSON(SETTINGS_FILE, t)
+end
+
+local macroListDirty = true
+local macroListCache = {}
+local function listMacros()
+    if not macroListDirty then return macroListCache end
+    local f = {}
+    pcall(function()
+        for _, p in pairs(listfiles(MACRO_FOLDER)) do
+            local n = p:match("([^/\\]+)%.json$")
+            if n then f[#f + 1] = n end
+        end
+    end)
+    macroListCache = f; macroListDirty = false
+    return f
+end
+local function dirtyMacroList() macroListDirty = true end
+
+-- ==================== LOGGING ====================
+local logBuffer, logEntries = {}, {}
+local logDirty = false
+
+local C = {
+    Pri = Color3.fromRGB(50, 60, 100), Sec = Color3.fromRGB(30, 40, 70),
+    Acc = Color3.fromRGB(100, 150, 255), Ok = Color3.fromRGB(34, 180, 34),
+    Bad = Color3.fromRGB(220, 40, 40), Bg = Color3.fromRGB(18, 18, 22),
+    Bg2 = Color3.fromRGB(30, 30, 38), Bg3 = Color3.fromRGB(12, 12, 16),
+    Tx = Color3.fromRGB(255, 255, 255), Dim = Color3.fromRGB(140, 140, 140),
+    Cyn = Color3.fromRGB(0, 200, 200), Org = Color3.fromRGB(230, 140, 30),
+    Blu = Color3.fromRGB(60, 120, 200), Off = Color3.fromRGB(50, 50, 55),
+}
+
+local function flushLog()
+    if #logBuffer == 0 then return end
+    pcall(function()
+        local old = isfile(LOG_FILE) and readfile(LOG_FILE) or ""
+        writefile(LOG_FILE, old .. table.concat(logBuffer, "\n") .. "\n")
+    end)
+    logBuffer = {}
+end
+
+local function addLog(text, color)
+    local line = os.date("%H:%M:%S") .. " " .. text
+    table.insert(logEntries, 1, {t = line, c = color or C.Dim})
+    if #logEntries > 20 then logEntries[21] = nil end
+    table.insert(logBuffer, line)
+    logDirty = true
+    if #logBuffer >= 5 then flushLog() end
+    print("[Macro] " .. text)
+end
+
+if _G.__TOWER_MACRO then
+    pcall(function() local o = LP.PlayerGui:FindFirstChild("TowerMacroUI"); if o then o:Destroy() end end)
+    _G.__TOWER_MACRO = false
+    task.wait(0.2)
+end
+_G.__TOWER_MACRO = true
+
+-- ==================== GAME PATHS ====================
+local leaderstats = LP:WaitForChild("leaderstats", 60)
+local Coins = leaderstats:WaitForChild("Coins", 30)
+local MapFolder = workspace:WaitForChild("Map", 60)
+local Values = RS:WaitForChild("Values")
+
+local Remotes = RS:WaitForChild("Remotes")
+local Funcs = Remotes:WaitForChild("Functions")
+local Evts = Remotes:WaitForChild("Events")
+
+local PlaceTower = Funcs:WaitForChild("PlaceTower")
+local UpgradeTower = Funcs:WaitForChild("UpgradeTower")
+local ReadyEvent = Evts:WaitForChild("Ready")
+local SkipEvent = Evts:WaitForChild("SkipWave")
+local GamemodeEvent = Evts:WaitForChild("Gamemode")
+local InitSpeedEvent = Evts:WaitForChild("InitChangeSpeed")
+local SpeedEventVote = Evts:WaitForChild("VoteChangeSpeed")
+local SpeedEventForce = Evts:WaitForChild("Change_Speed")
+local ReplayEvent = Evts:WaitForChild("Replay")
+local ClientRemote = Evts:WaitForChild("Client_Remote")
+
+-- Game's Internal Data Module
+local GameConstants = require(RS:WaitForChild("Modules"):WaitForChild("Data"):WaitForChild("Constants"))
+
+local function gCoins() return Coins.Value end
+local function gWave() return Values.Wave.Value end
+local function gRunning() return Values.GameRunning.Value end
+local function canGo() return S.replaying and _G.__TOWER_MACRO end
+
+local function checkGameOver()
+    local isOver = false
+    pcall(function() isOver = LP.PlayerGui.UI.Game.GameOver.Visible end)
+    if not gRunning() and gWave() > 0 then isOver = true end
+    return isOver
+end
+
+local function getPlaceablePart()
+    local innerMap = MapFolder:FindFirstChild("Map")
+    if innerMap then
+        for _, child in ipairs(innerMap:GetChildren()) do
+            if child:IsA("Model") or child:IsA("Folder") then
+                local placeable = child:FindFirstChild("Placeable")
+                if placeable then
+                    local p = placeable:FindFirstChild("Part") or placeable:FindFirstChildWhichIsA("BasePart")
+                    if p then return p end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function extractID(tbl)
+    for k, v in pairs(tbl) do
+        if type(v) == "string" and string.match(v, "^%x+%-%x+%-%x+%-%x+%-%x+$") then return v end
+        if type(v) == "string" and string.match(v, "^%d+$") then return v end
+        if type(v) == "number" then return tostring(v) end
+        if type(v) == "table" then
+            local res = extractID(v)
+            if res then return res end
+        end
+    end
+    return nil
+end
+
+-- ==================== DYNAMIC ID RESOLVER ====================
+local function getDynamicTowerID(targetTowerName)
+    local data = GameConstants.currentPlrData
+    if data and data.Equipped and data.Items then
+        for slot, uuid in pairs(data.Equipped.Towers) do
+            if uuid and data.Items.Towers[uuid] then
+                if data.Items.Towers[uuid].Tower == targetTowerName then
+                    return uuid
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- ==================== STRICT SERVER ID TRACKER ====================
+local myPlacedTowers = {}
+local failedPlacements = {}
+local myPlacedCount = 0
+local currentReplayPlacementOrder = nil
+
+local function resetTowerTracking()
+    myPlacedTowers = {}
+    failedPlacements = {}
+    myPlacedCount = 0
+    currentReplayPlacementOrder = nil
+end
+
+ClientRemote.OnClientEvent:Connect(function(funcName, data)
+    if funcName == "PlaceTower" and type(data) == "table" then
+        if data.O == LP.Name then
+            myPlacedCount = myPlacedCount + 1
+            if S.replaying and currentReplayPlacementOrder then
+                myPlacedTowers[currentReplayPlacementOrder] = tostring(data.I)
+            end
+        end
+    end
+end)
+
+-- ==================== SMART RECORDING ENGINE ====================
+local recData = { actions = {} }
+local placeCounter = 0
+
+pcall(function()
+    local mt = getrawmetatable(game)
+    local oldNamecall = mt.__namecall
+    setreadonly(mt, false)
+
+    mt.__namecall = newcclosure(function(self, ...)
+        local args = {...}
+        local method = getnamecallmethod()
+        
+        if not checkcaller() and S.recording and method == "InvokeServer" then
+            if self.Name == "PlaceTower" and type(args[1]) == "table" then
+                local data = args[1]
+                local result = {oldNamecall(self, ...)}
+                
+                if type(result[1]) == "table" then
+                    placeCounter = placeCounter + 1
+                    local localID = placeCounter
+                    
+                    local act = {
+                        type = "place",
+                        placementOrder = localID,
+                        towerName = data.towerToPlace,
+                        towerID = data.towerID, 
+                        x = data.position.X, y = data.position.Y, z = data.position.Z
+                    }
+                    table.insert(recData.actions, act)
+                    addLog("📍 Recorded PLACE: " .. data.towerToPlace, C.Ok)
+                    
+                    local sID = extractID(result[1])
+                    if sID then myPlacedTowers[localID] = sID end
+                end
+                
+                return unpack(result)
+                
+            elseif self.Name == "UpgradeTower" then
+                local result = {oldNamecall(self, ...)}
+                
+                if result[1] == true then
+                    local sID = tostring(args[1])
+                    local localID = nil
+                    
+                    for order, id in pairs(myPlacedTowers) do
+                        if id == sID then
+                            localID = order
+                            break
+                        end
+                    end
+                    
+                    if localID then
+                        local act = { type = "upgrade", placementOrder = localID }
+                        table.insert(recData.actions, act)
+                        addLog("⬆ Recorded UPGRADE: #" .. localID, C.Blu)
+                    end
+                end
+                
+                return unpack(result)
+            end
+        end
+        return oldNamecall(self, ...)
+    end)
+    setreadonly(mt, true)
+end)
+
+local function startRec()
+    S.recording = true; recData.actions = {};
+    resetTowerTracking()
+    placeCounter = 0
+    addLog("⏺ REC START W" .. gWave(), C.Bad)
+end
+
+local function stopRec()
+    S.recording = false
+    addLog("⏹ REC STOP: " .. #recData.actions .. " actions", C.Acc)
+end
+
+-- ==================== REPLAY SYSTEM ====================
+local function doReplay(data, sL)
+    if not data or not data.actions or #data.actions == 0 then addLog("❌ No actions", C.Bad); return end
+    S.replaying = true
+    resetTowerTracking()
+    addLog("▶ REPLAY START (" .. #data.actions .. ")", C.Cyn)
+    
+    for i, a in ipairs(data.actions) do
+        if not canGo() or checkGameOver() then addLog("⏹ STOPPED at #" .. i, C.Org); break end
+
+        if a.type == "place" then
+            if sL then sL.Text = "📍 " .. a.towerName .. " (" .. i .. "/" .. #data.actions .. ")" end
+
+            local placePart = getPlaceablePart()
+            local actualID = getDynamicTowerID(a.towerName) or a.towerID
+            local args = {[1] = {["towerID"] = actualID, ["towerToPlace"] = a.towerName, ["instance"] = placePart, ["position"] = Vector3.new(a.x, a.y, a.z)}}
+
+            currentReplayPlacementOrder = a.placementOrder
+            local preCount = myPlacedCount
+            
+            while canGo() and not checkGameOver() do
+                local ok, res = pcall(function() return PlaceTower:InvokeServer(unpack(args)) end)
+                
+                if ok and type(res) == "table" then
+                    local sID = extractID(res)
+                    if sID then myPlacedTowers[a.placementOrder] = sID end
+                    
+                    local waited = 0
+                    while myPlacedCount == preCount and waited < 3 do
+                        task.wait(0.1)
+                        waited = waited + 0.1
+                    end
+                    addLog("✅ PLACED #" .. a.placementOrder .. " " .. a.towerName, C.Ok)
+                    break
+                elseif ok and type(res) == "string" then
+                    local err = string.upper(res)
+                    if string.match(err, "ENOUGH") or string.match(err, "COIN") or string.match(err, "CASH") or string.match(err, "MONEY") then
+                        task.wait(0.25)
+                    else
+                        addLog("❌ PLACE FAILED: " .. res, C.Bad)
+                        failedPlacements[a.placementOrder] = true 
+                        break
+                    end
+                else
+                    task.wait(0.25)
+                end
+            end
+
+        elseif a.type == "upgrade" then
+            if failedPlacements[a.placementOrder] then
+                addLog("⏭️ SKIP UPG: Tower #" .. a.placementOrder .. " missing", C.Dim)
+                continue
+            end
+
+            local targetId = myPlacedTowers[a.placementOrder]
+            
+            local waitedId = 0
+            while not targetId and waitedId < 5 and canGo() and not checkGameOver() do
+                task.wait(0.25)
+                waitedId = waitedId + 0.25
+                targetId = myPlacedTowers[a.placementOrder]
+            end
+            
+            if not targetId then
+                addLog("❌ UPG FAILED: Tower ID missing", C.Bad)
+                continue 
+            end
+
+            if sL then sL.Text = "⬆ Upgrade #" .. a.placementOrder .. " (" .. i .. "/" .. #data.actions .. ")" end
+            local args = {[1] = targetId }
+            
+            while canGo() and not checkGameOver() do
+                local ok, res1, res2 = pcall(function() return UpgradeTower:InvokeServer(unpack(args)) end)
+                if ok then
+                    local msg = tostring(res1 or "") .. tostring(res2 or "")
+                    local err = string.upper(msg)
+                    if res1 == true or err == "TRUE" or string.match(err, "SUCCESS") then
+                        addLog("✅ UPGRADED #" .. a.placementOrder, C.Blu)
+                        break
+                    elseif string.match(err, "ENOUGH") or string.match(err, "COIN") or string.match(err, "CASH") or string.match(err, "MONEY") then
+                        task.wait(0.25)
+                    else
+                        addLog("❌ UPG FAILED: " .. msg, C.Bad)
+                        break
+                    end
+                else
+                    task.wait(0.25)
+                end
+            end
+        end
+    end
+
+    if S.autoMax and canGo() and not checkGameOver() then
+        addLog("🌟 AUTO-MAXING ALL TOWERS...", C.Org)
+        if sL then sL.Text = "🌟 Auto-Maxing..." end
+        local maxedTowers = {}
+        
+        while canGo() and not checkGameOver() do
+            local upgradedAny = false
+            for order, tID in pairs(myPlacedTowers) do
+                if not canGo() or checkGameOver() then break end
+                if maxedTowers[tID] then continue end
+                
+                local ok, res1, res2 = pcall(function() return UpgradeTower:InvokeServer(tID) end)
+                if ok then
+                    local msg = string.upper(tostring(res1 or "") .. tostring(res2 or ""))
+                    if res1 == true or msg == "TRUE" or string.match(msg, "SUCCESS") then
+                        addLog("🌟 MAX-UPGRADED #" .. order, C.Blu)
+                        upgradedAny = true
+                        task.wait(0.1)
+                    elseif string.match(msg, "MAX") or string.match(msg, "LIMIT") then
+                        maxedTowers[tID] = true
+                    end
+                end
+            end
+            if not upgradedAny then
+                task.wait(1) 
+            end
+        end
+    end
+
+    S.replaying = false
+    addLog("⏹ REPLAY DONE", C.Cyn)
+    if sL then sL.Text = gRunning() and "✅ Done" or "🏁 Game Over" end
+end
+
+-- ==================== GUI ====================
+local gui = Instance.new("ScreenGui", LP.PlayerGui)
+gui.Name = "TowerMacroUI"; gui.ResetOnSpawn = false
+
+local mainH = 605
+local main = Instance.new("Frame", gui)
+main.Size = UDim2.new(0, 260, 0, mainH); main.Position = UDim2.new(0, 20, 0.5, -mainH/2)
+main.BackgroundColor3 = C.Bg; main.BorderSizePixel = 0; main.Active = true
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+Instance.new("UIStroke", main).Color = C.Pri
+
+local hdr = Instance.new("Frame", main)
+hdr.Size = UDim2.new(1, 0, 0, 36); hdr.BackgroundColor3 = C.Pri; hdr.BorderSizePixel = 0
+Instance.new("UICorner", hdr).CornerRadius = UDim.new(0, 10)
+local hf = Instance.new("Frame", hdr)
+hf.Size = UDim2.new(1, 0, 0, 10); hf.Position = UDim2.new(0, 0, 1, -10); hf.BackgroundColor3 = C.Pri; hf.BorderSizePixel = 0
+
+local tt = Instance.new("TextLabel", hdr)
+tt.Size = UDim2.new(1, -60, 1, 0); tt.Position = UDim2.new(0, 8, 0, 0)
+tt.BackgroundTransparency = 1; tt.TextColor3 = C.Tx; tt.TextSize = 10
+tt.Font = Enum.Font.GothamBlack; tt.TextXAlignment = Enum.TextXAlignment.Left
+tt.Text = "⚔ Tower Macro V26"
+
+local function hBtn(tx, pos, col)
+    local b = Instance.new("TextButton", hdr)
+    b.Size = UDim2.new(0, 20, 0, 20); b.Position = pos; b.BackgroundColor3 = col
+    b.Text = tx; b.TextColor3 = C.Tx; b.TextSize = 10; b.Font = Enum.Font.GothamBold
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4); return b
+end
+local minB = hBtn("—", UDim2.new(1, -48, 0.5, -10), C.Sec)
+local clsB = hBtn("✕", UDim2.new(1, -24, 0.5, -10), C.Bad)
+
+local cont = Instance.new("ScrollingFrame", main)
+cont.Size = UDim2.new(1, -8, 1, -40); cont.Position = UDim2.new(0, 4, 0, 38)
+cont.BackgroundTransparency = 1; cont.ScrollBarThickness = 2; cont.ScrollBarImageColor3 = C.Pri
+cont.AutomaticCanvasSize = Enum.AutomaticSize.Y; cont.CanvasSize = UDim2.new(0, 0, 0, 0)
+local cL = Instance.new("UIListLayout", cont); cL.SortOrder = Enum.SortOrder.LayoutOrder; cL.Padding = UDim.new(0, 3)
+local cP = Instance.new("UIPadding", cont); cP.PaddingBottom = UDim.new(0, 40)
+
+local ord = 0
+local function nO() ord = ord + 1; return ord end
+
+local function mkS(t, h)
+    local f = Instance.new("Frame", cont)
+    f.Size = UDim2.new(1, 0, 0, h); f.BackgroundColor3 = C.Bg2; f.LayoutOrder = nO()
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 6)
+    local l = Instance.new("TextLabel", f)
+    l.Size = UDim2.new(1, -6, 0, 11); l.Position = UDim2.new(0, 5, 0, 1)
+    l.BackgroundTransparency = 1; l.Text = t; l.TextColor3 = C.Dim; l.TextSize = 7
+    l.Font = Enum.Font.GothamBold; l.TextXAlignment = Enum.TextXAlignment.Left
+    return f
+end
+
+local function mkT(p, tx, y, key, cb)
+    local on = S[key] or false
+    local b = Instance.new("TextButton", p)
+    b.Size = UDim2.new(1, -8, 0, 22); b.Position = UDim2.new(0, 4, 0, y)
+    b.BackgroundColor3 = C.Bg; b.Text = ""
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
+    local l = Instance.new("TextLabel", b)
+    l.Size = UDim2.new(1, -38, 1, 0); l.Position = UDim2.new(0, 5, 0, 0)
+    l.BackgroundTransparency = 1; l.Text = tx; l.TextColor3 = C.Tx; l.TextSize = 9
+    l.Font = Enum.Font.GothamMedium; l.TextXAlignment = Enum.TextXAlignment.Left
+    local tr = Instance.new("Frame", b)
+    tr.Size = UDim2.new(0, 28, 0, 12); tr.Position = UDim2.new(1, -32, 0.5, -6)
+    tr.BackgroundColor3 = on and C.Ok or C.Off
+    Instance.new("UICorner", tr).CornerRadius = UDim.new(1, 0)
+    local ci = Instance.new("Frame", tr)
+    ci.Size = UDim2.new(0, 8, 0, 8); ci.Position = on and UDim2.new(1, -10, 0.5, -4) or UDim2.new(0, 2, 0.5, -4)
+    ci.BackgroundColor3 = C.Tx; Instance.new("UICorner", ci).CornerRadius = UDim.new(1, 0)
+
+    b.MouseButton1Click:Connect(function()
+        on = not on; S[key] = on; saveS()
+        tr.BackgroundColor3 = on and C.Ok or C.Off
+        ci.Position = on and UDim2.new(1, -10, 0.5, -4) or UDim2.new(0, 2, 0.5, -4)
+        if cb then cb(on) end
+    end)
+end
+
+local function mkB(p, tx, x, y, w, h, col, cb)
+    local b = Instance.new("TextButton", p)
+    b.Size = UDim2.new(w, -2, 0, h); b.Position = UDim2.new(x, 1, 0, y)
+    b.BackgroundColor3 = col; b.Text = tx; b.TextColor3 = C.Tx; b.TextSize = 8; b.Font = Enum.Font.GothamBold
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
+    if cb then b.MouseButton1Click:Connect(cb) end
+    return b
+end
+
+local function mkCycler(parent, values, startIdx, y, onChange)
+    local idx = startIdx
+    local f = Instance.new("Frame", parent)
+    f.Size = UDim2.new(1,-8,0,22); f.Position = UDim2.new(0,4,0,y)
+    f.BackgroundColor3 = C.Bg3
+    Instance.new("UICorner",f).CornerRadius = UDim.new(0,4)
+    local lB = Instance.new("TextButton",f)
+    lB.Size = UDim2.new(0,24,1,0); lB.Position = UDim2.new(0,0,0,0)
+    lB.BackgroundColor3 = C.Sec; lB.Text = "◀"; lB.TextColor3 = C.Tx
+    lB.TextSize = 11; lB.Font = Enum.Font.GothamBold
+    Instance.new("UICorner",lB).CornerRadius = UDim.new(0,4)
+    local rB = Instance.new("TextButton",f)
+    rB.Size = UDim2.new(0,24,1,0); rB.Position = UDim2.new(1,-24,0,0)
+    rB.BackgroundColor3 = C.Sec; rB.Text = "▶"; rB.TextColor3 = C.Tx
+    rB.TextSize = 11; rB.Font = Enum.Font.GothamBold
+    Instance.new("UICorner",rB).CornerRadius = UDim.new(0,4)
+    local vL = Instance.new("TextLabel",f)
+    vL.Size = UDim2.new(1,-52,1,0); vL.Position = UDim2.new(0,26,0,0)
+    vL.BackgroundTransparency = 1; vL.TextColor3 = C.Acc
+    vL.TextSize = 10; vL.Font = Enum.Font.GothamBold
+    vL.Text = tostring(values[idx] or "—")
+    local function update()
+        vL.Text = tostring(values[idx] or "—")
+        onChange(idx, values[idx])
+    end
+    lB.MouseButton1Click:Connect(function()
+        local n = #values; if n == 0 then return end
+        idx = idx - 1; if idx < 1 then idx = n end; update()
+    end)
+    rB.MouseButton1Click:Connect(function()
+        local n = #values; if n == 0 then return end
+        idx = idx + 1; if idx > n then idx = 1 end; update()
+    end)
+end
+
+-- STATUS
+local sSec = mkS("STATUS", 30)
+local sLbl = Instance.new("TextLabel", sSec)
+sLbl.Size = UDim2.new(1, -8, 0, 12); sLbl.Position = UDim2.new(0, 4, 0, 15)
+sLbl.BackgroundTransparency = 1; sLbl.Text = "✅ Ready"; sLbl.TextColor3 = C.Ok
+sLbl.TextSize = 9; sLbl.Font = Enum.Font.GothamMedium; sLbl.TextXAlignment = Enum.TextXAlignment.Left
+
+-- AUTOMATION
+local aSec = mkS("AUTOMATION", 136)
+mkT(aSec, "Auto Ready", 13, "autoReady")
+mkT(aSec, "Auto Fast Skip", 37, "autoSkip")
+mkT(aSec, "Auto 2x Speed", 61, "autoSpeed")
+mkT(aSec, "Auto Replay Match", 85, "autoReplay")
+mkT(aSec, "Auto Max Towers", 109, "autoMax")
+
+-- GAMEMODE
+local gmSec = mkS("GAMEMODE", 40)
+local MODES = {"Easy", "Medium", "Hard", "Extreme", "Insane"}
+local startModeIdx = 4
+for i, m in ipairs(MODES) do if m == S.gamemode then startModeIdx = i end end
+mkCycler(gmSec, MODES, startModeIdx, 14, function(_, val)
+    S.gamemode = val; saveS()
+end)
+
+-- MACRO
+local mSec = mkS("MACRO", 168)
+local nb = Instance.new("TextBox", mSec)
+nb.Size = UDim2.new(1, -8, 0, 16); nb.Position = UDim2.new(0, 4, 0, 13)
+nb.BackgroundColor3 = C.Bg; nb.Text = S.macroName or ""
+nb.PlaceholderText = "macro name..."; nb.TextColor3 = C.Acc
+nb.PlaceholderColor3 = C.Dim; nb.TextSize = 8; nb.Font = Enum.Font.GothamMedium
+nb.ClearTextOnFocus = false
+Instance.new("UICorner", nb).CornerRadius = UDim.new(0, 3)
+
+nb.FocusLost:Connect(function() S.macroName = nb.Text; saveS() end)
+
+local g_recB = mkB(mSec, "⏺ REC", 0, 32, 0.48, 20, C.Bad)
+local g_stpB = mkB(mSec, "⏹ STOP", 0.5, 32, 0.48, 20, C.Sec); g_stpB.Visible = false
+
+g_recB.MouseButton1Click:Connect(function()
+    if not getrawmetatable then
+        addLog("❌ EXECUTOR CANNOT RECORD!", C.Bad)
+        return
+    end
+    if S.recording then return end
+    startRec(); g_recB.Visible = false; g_stpB.Visible = true
+end)
+g_stpB.MouseButton1Click:Connect(function()
+    if not S.recording then return end
+    stopRec(); g_recB.Visible = true; g_stpB.Visible = false
+end)
+
+mkB(mSec, "💾 SAVE", 0, 56, 0.32, 20, C.Ok, function()
+    local n = nb.Text; if n == "" then addLog("Enter name", C.Acc); return end
+    S.macroName = n; saveS()
+    saveJSON(MACRO_FOLDER .. "/" .. n .. ".json", { name = n, date = os.date(), actions = recData.actions })
+    dirtyMacroList(); addLog("💾 SAVED " .. n, C.Ok)
+end)
+
+mkB(mSec, "📂 LOAD", 0.34, 56, 0.32, 20, C.Blu, function()
+    local n = nb.Text
+    if n == "" then local f = listMacros(); if #f > 0 then n = f[1]; nb.Text = n else return end end
+    local d = loadJSON(MACRO_FOLDER .. "/" .. n .. ".json")
+    if d then S.macro = d; recData.actions = d.actions or {}; S.macroName = n; saveS()
+        addLog("📂 LOADED " .. n, C.Blu)
+    else addLog("❌ NOT FOUND", C.Bad) end
+end)
+
+mkB(mSec, "🗑 DEL", 0.68, 56, 0.3, 20, C.Bad, function()
+    local n = nb.Text; if n == "" then return end
+    pcall(function() delfile(MACRO_FOLDER .. "/" .. n .. ".json") end)
+    dirtyMacroList(); addLog("🗑 DEL " .. n, C.Org)
+end)
+
+local g_mInfo = Instance.new("TextLabel", mSec)
+g_mInfo.Size = UDim2.new(1, -8, 0, 10); g_mInfo.Position = UDim2.new(0, 4, 0, 80)
+g_mInfo.BackgroundTransparency = 1; g_mInfo.TextColor3 = C.Dim; g_mInfo.TextSize = 7
+g_mInfo.Font = Enum.Font.Gotham; g_mInfo.TextXAlignment = Enum.TextXAlignment.Left
+g_mInfo.TextTruncate = Enum.TextTruncate.AtEnd
+
+local g_repB = mkB(mSec, "▶ REPLAY", 0, 94, 0.48, 20, C.Cyn, function()
+    if S.replaying then S.replaying = false; addLog("⏹ CANCEL REPLAY", C.Org); return end
+    local d = S.macro
+    if not d and #recData.actions > 0 then d = { name = S.macroName, actions = recData.actions } end
+    if not d or #(d.actions or {}) == 0 then addLog("No macro loaded", C.Acc); return end
+    task.spawn(function() doReplay(d, sLbl) end)
+end)
+
+local g_actL = Instance.new("TextLabel", mSec)
+g_actL.Size = UDim2.new(0.48, 0, 0, 20); g_actL.Position = UDim2.new(0.5, 0, 0, 94)
+g_actL.BackgroundTransparency = 1; g_actL.TextColor3 = C.Dim; g_actL.TextSize = 8; g_actL.Font = Enum.Font.GothamMedium
+
+local g_prevL = Instance.new("TextLabel", mSec)
+g_prevL.Size = UDim2.new(1, -8, 0, 18); g_prevL.Position = UDim2.new(0, 4, 0, 116)
+g_prevL.BackgroundTransparency = 1; g_prevL.TextColor3 = C.Dim; g_prevL.TextSize = 6
+g_prevL.Font = Enum.Font.Code; g_prevL.TextXAlignment = Enum.TextXAlignment.Left
+g_prevL.TextWrapped = true
+
+mkT(mSec, "Auto Play Macro", 140, "autoPlay")
+
+-- LOG
+local lSec = mkS("LOG", 145)
+mkB(lSec, "📋 DUMP", 0, 12, 0.48, 16, C.Sec, function() flushLog(); addLog("LOG → " .. LOG_FILE, C.Ok) end)
+mkB(lSec, "🗑 CLEAR", 0.5, 12, 0.48, 16, C.Sec, function()
+    logEntries = {}; logBuffer = {}; pcall(function() writefile(LOG_FILE, "") end); logDirty = true
+end)
+
+local logS = Instance.new("ScrollingFrame", lSec)
+logS.Size = UDim2.new(1, -4, 0, 108); logS.Position = UDim2.new(0, 2, 0, 31)
+logS.BackgroundColor3 = C.Bg3; logS.BackgroundTransparency = 0.2; logS.ScrollBarThickness = 2
+logS.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Instance.new("UICorner", logS).CornerRadius = UDim.new(0, 3)
+local lLay = Instance.new("UIListLayout", logS); lLay.Padding = UDim.new(0, 0); lLay.SortOrder = Enum.SortOrder.LayoutOrder
+
+local LOG_N = 20; local logLbls = {}
+for i = 1, LOG_N do
+    local l = Instance.new("TextLabel", logS)
+    l.Size = UDim2.new(1, -2, 0, 11); l.BackgroundTransparency = 1; l.Text = ""
+    l.TextColor3 = C.Dim; l.TextSize = 7; l.Font = Enum.Font.Code; l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextTruncate = Enum.TextTruncate.AtEnd; l.LayoutOrder = i; l.Visible = false
+    logLbls[i] = l
+end
+
+-- Dragging
+local drag, dS, dP = false, nil, nil
+hdr.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 then drag = true; dS = i.Position; dP = main.Position end
+end)
+hdr.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 then drag = false end
+end)
+UIS.InputChanged:Connect(function(i)
+    if drag and i.UserInputType == Enum.UserInputType.MouseMovement then
+        local d = i.Position - dS
+        main.Position = UDim2.new(dP.X.Scale, dP.X.Offset + d.X, dP.Y.Scale, dP.Y.Offset + d.Y)
+    end
+end)
+
+local minimized = false
+clsB.MouseButton1Click:Connect(function() saveS(); flushLog(); _G.__TOWER_MACRO = false; gui:Destroy() end)
+minB.MouseButton1Click:Connect(function()
+    minimized = not minimized; cont.Visible = not minimized
+    main.Size = minimized and UDim2.new(0, 260, 0, 36) or UDim2.new(0, 260, 0, mainH)
+    minB.Text = minimized and "+" or "—"
+end)
+
+-- ==================== MAIN LOOP ====================
+if S.macroName and S.macroName ~= "" then
+    local d = loadJSON(MACRO_FOLDER .. "/" .. S.macroName .. ".json")
+    if d then S.macro = d; recData.actions = d.actions or {}; addLog("📂 AUTO-LOADED " .. S.macroName, C.Blu) end
+end
+
+-- Auto Skip Loop
+task.spawn(function()
+    while _G.__TOWER_MACRO and gui.Parent do
+        if S.autoSkip and gRunning() and gWave() >= 1 then
+            pcall(function() SkipEvent:FireServer() end)
+        end
+        task.wait(0.2) 
+    end
+end)
+
+task.spawn(function()
+    while _G.__TOWER_MACRO and gui.Parent do
+        local gr = gRunning()
+        local wv = gWave()
+        local isGameOver = checkGameOver()
+
+        -- LOBBY STATE
+        if not gr and wv == 0 and not isGameOver then
+            S.macroPlayed = false
+            S.gameEndHandled = false
+            
+            -- Reset speed tracker so it can trigger next game
+            S.lastSpeedAttempt = 0
+            S.speedCap = 3
+            
+            resetTowerTracking()
+            
+            if S.autoReady then
+                if not S.readyFired then
+                    S.readyFired = true
+                    S.gamemodeLogged = false
+                    addLog("🟢 Firing Ready Up", C.Cyn)
+                    pcall(function() ReadyEvent:FireServer() end)
+                end
+                
+                -- Continuously check and vote gamemode while in lobby to ensure it doesn't miss the UI
+                if S.gamemode and S.gamemode ~= "" then
+                    if tick() - (S.lastGamemodeAttempt or 0) > 2 then
+                        S.lastGamemodeAttempt = tick()
+                        if not S.gamemodeLogged then
+                            addLog("🗳️ Voting Gamemode: " .. S.gamemode, C.Cyn)
+                            S.gamemodeLogged = true
+                        end
+                        pcall(function() GamemodeEvent:FireServer(S.gamemode) end)
+                    end
+                end
+            end
+
+        -- PLAYING STATE
+        elseif gr then
+            S.readyFired = false
+            S.gameEndHandled = false
+
+            -- ROBUST SPEED CHECK: Smart Auto-Speed & Anti-Downgrade
+            if S.autoSpeed then
+                local currentSpeed = 1
+                pcall(function() currentSpeed = math.floor(Values.Speed.Value) end)
+                
+                local voteUI
+                pcall(function() voteUI = LP.PlayerGui.UI.Game:FindFirstChild("SpeedVote") end)
+                
+                S.speedCap = S.speedCap or 3 -- Default assume max is 3x
+                
+                if voteUI and voteUI.Visible then
+                    local newSpeedText = ""
+                    local didIInitiate = false
+                    
+                    pcall(function() 
+                        newSpeedText = voteUI.Container.Info.New.Text 
+                        didIInitiate = voteUI.Container.Info.Yes.Locked.Visible
+                    end)
+                    
+                    local newSpeed = tonumber(string.match(newSpeedText, "%d+")) or 0
+                    
+                    if newSpeed > currentSpeed then
+                        -- Genuine upgrade! Vote YES!
+                        if not didIInitiate and tick() - (S.lastVoteAttempt or 0) > 1.5 then
+                            S.lastVoteAttempt = tick()
+                            addLog("⚡ Voting YES for " .. newSpeedText .. " Speed", C.Cyn)
+                            pcall(function() SpeedEventVote:FireServer() end)
+                        end
+                    else
+                        -- Useless or downgrade vote
+                        if didIInitiate then
+                            if S.speedCap > currentSpeed then
+                                S.speedCap = currentSpeed
+                                addLog("⚡ Speed capped at " .. S.speedCap .. "x for this account.", C.Dim)
+                            end
+                        end
+                        -- Hide the useless vote so it doesn't block us visually
+                        pcall(function() voteUI.Visible = false end)
+                    end
+                else
+                    -- Initiate vote if we are below our known cap
+                    if currentSpeed < S.speedCap then
+                        if tick() - (S.lastSpeedAttempt or 0) > 5 then
+                            S.lastSpeedAttempt = tick()
+                            addLog("⚡ Initiating Auto Speed...", C.Cyn)
+                            pcall(function() InitSpeedEvent:FireServer(1) end) 
+                            pcall(function() SpeedEventForce:FireServer(currentSpeed + 1) end)
+                        end
+                    end
+                end
+            end
+
+            if S.autoPlay and S.macro and not S.replaying and not S.macroPlayed then
+                S.macroPlayed = true
+                task.spawn(function()
+                    task.wait(2)
+                    if S.autoPlay and not S.replaying and _G.__TOWER_MACRO then
+                        addLog("🤖 AUTO PLAY START", C.Cyn); doReplay(S.macro, sLbl)
+                    end
+                end)
+            end
+
+        -- GAME OVER STATE
+        elseif isGameOver then
+            S.readyFired = false
+            S.macroPlayed = false
+
+            if S.autoReplay and not S.gameEndHandled then
+                S.gameEndHandled = true
+                addLog("🔄 Auto Replay in 4s...", C.Cyn)
+                task.spawn(function()
+                    task.wait(4)
+                    if _G.__TOWER_MACRO then
+                        pcall(function() ReplayEvent:FireServer() end)
+                        addLog("🔄 Replay Fired", C.Ok)
+                    end
+                end)
+            end
+        end
+
+        if not S.replaying then
+            if gr then sLbl.Text = "🎮 W" .. wv .. " $" .. gCoins(); sLbl.TextColor3 = C.Ok
+            elseif isGameOver then sLbl.Text = "🏁 Game Over $" .. gCoins(); sLbl.TextColor3 = C.Org
+            else sLbl.Text = "⚪ Lobby $" .. gCoins(); sLbl.TextColor3 = C.Dim end
+        end
+
+        local ac = #recData.actions; local lc = S.macro and #(S.macro.actions or {}) or 0
+        g_actL.Text = ac > 0 and ("📍" .. ac) or (lc > 0 and ("📂" .. lc) or "0")
+        
+        local fl = listMacros(); g_mInfo.Text = #fl > 0 and table.concat(fl, ", ") or "no macros"
+        g_repB.Text = S.replaying and "⏹ STOP" or "▶ REPLAY"
+        g_repB.BackgroundColor3 = S.replaying and C.Bad or C.Cyn
+
+        if logDirty then
+            for i = 1, LOG_N do
+                local e = logEntries[i]; local lb = logLbls[i]
+                if e then lb.Text = e.t; lb.TextColor3 = e.c; lb.Visible = true else lb.Visible = false end
+            end
+            logDirty = false
+        end
+
+        flushLog()
+        task.wait(0.5)
+    end
+end)
+
+addLog("⚔ Tower Macro V26 Ready", C.Ok)
