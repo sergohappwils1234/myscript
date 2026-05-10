@@ -1,0 +1,680 @@
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local CoreGui = game:GetService("CoreGui")
+local LP = Players.LocalPlayer
+
+-- Remotes
+local Remotes = RS:WaitForChild("Remotes"):WaitForChild("Functions")
+local SummonRF = Remotes:WaitForChild("Summon")
+local DeleteUnitRF = Remotes:WaitForChild("DeleteUnit")
+local EnchantRF = Remotes:WaitForChild("Enchant")
+local AutoDeleteRF = Remotes:FindFirstChild("AutoDelete")
+local BuyCrateRF = Remotes:WaitForChild("BuyBattlepassCrateSpin")
+local SpinCrateRF = Remotes:WaitForChild("SpinBattlepassCrate")
+
+-- Data Modules
+local Modules = RS:WaitForChild("Modules")
+local Data = Modules:WaitForChild("Data")
+local Constants = require(Data:WaitForChild("Constants"))
+local TowersData = require(Data:WaitForChild("Towers"))
+local SummonBanners = require(Data:WaitForChild("SummonBanners"))
+local EnchantsData = require(Data:WaitForChild("Enchants"))
+
+-----------------------------------
+-- DATA GATHERING (Dynamic)
+-----------------------------------
+local availableBanners = {}
+for bannerName, _ in pairs(SummonBanners.Banners) do
+    table.insert(availableBanners, bannerName)
+end
+if #availableBanners == 0 then table.insert(availableBanners, "Standard") end
+
+local availableEnchants = {}
+for enchantName, _ in pairs(EnchantsData.Enchants) do
+    table.insert(availableEnchants, enchantName)
+end
+table.sort(availableEnchants)
+
+local raritiesList = {"Common", "Rare", "Epic", "Legendary", "Mythic", "Secret", "Exclusive"}
+
+-----------------------------------
+-- SETTINGS & SAVING
+-----------------------------------
+local SETTINGS_FILE = "NoobTD_LobbySettings_" .. LP.Name .. ".json"
+
+local S = {
+    SummonBannerIdx = 1,
+    SummonAmountIdx = 1, -- 1 = 1x, 2 = 10x
+    SummonDelay = 0.5,
+    AutoSummon = false,
+    
+    DeleteNormal = {Common=false, Rare=false, Epic=false, Legendary=false, Mythic=false, Secret=false, Exclusive=false},
+    DeleteShiny = {Common=false, Rare=false, Epic=false, Legendary=false, Mythic=false, Secret=false, Exclusive=false},
+    
+    TargetEnchants = {},
+    EnchantDelay = 0.3,
+    AutoEnchant = false,
+    
+    BuyCrateDelay = 0.5,
+    AutoBuyCrate = false,
+    
+    SpinCrateDelay = 0.5,
+    AutoSpinCrate = false
+}
+
+local function saveSettings()
+    pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(S)) end)
+end
+
+local function loadSettings()
+    pcall(function()
+        if isfile(SETTINGS_FILE) then
+            local data = HttpService:JSONDecode(readfile(SETTINGS_FILE))
+            for k, v in pairs(data) do 
+                if type(v) == "table" and type(S[k]) == "table" then
+                    for subK, subV in pairs(v) do S[k][subK] = subV end
+                else
+                    S[k] = v 
+                end
+            end
+        end
+    end)
+end
+loadSettings()
+
+-----------------------------------
+-- NATIVE AUTO DELETE SYNC
+-----------------------------------
+local function syncNativeAutoDelete(rarity, isShiny, state)
+    if AutoDeleteRF then
+        task.spawn(function()
+            pcall(function() AutoDeleteRF:InvokeServer(rarity, isShiny, state) end)
+            pcall(function() AutoDeleteRF:InvokeServer(rarity, state) end)
+        end)
+    end
+end
+
+-----------------------------------
+-- INVENTORY GROUPING
+-----------------------------------
+local inventorySorted = {}
+local activeEnchantUUID = nil
+local activeEnchantDisplay = "None"
+
+local function getInventoryGroups()
+    local groups = {}
+    local inv = Constants.currentPlrData.Items.Towers
+    local eq = Constants.currentPlrData.Equipped.Towers
+    local eqMap = {}
+    for _, u in pairs(eq) do eqMap[u] = true end
+    
+    for uuid, tData in pairs(inv) do
+        if not eqMap[uuid] and not tData.Locked then
+            local ench = (tData.Mutations and tData.Mutations.Enchant) or "None"
+            local shiny = (tData.Mutations and tData.Mutations.Shiny) and "Yes" or "No"
+            local name = tData.Tower
+            
+            local key = name .. "|" .. ench .. "|" .. shiny
+            local display = string.format("%s | Ench: %s | Shiny: %s", name, ench, shiny)
+            
+            if not groups[key] then
+                groups[key] = {display = display, count = 0, uuids = {}}
+            end
+            groups[key].count += 1
+            table.insert(groups[key].uuids, uuid)
+        end
+    end
+    
+    local sorted = {}
+    for k, v in pairs(groups) do
+        table.insert(sorted, {key = k, display = string.format("[x%d] %s", v.count, v.display), uuids = v.uuids, rawDisplay = v.display})
+    end
+    table.sort(sorted, function(a,b) return a.display < b.display end)
+    return sorted
+end
+
+-----------------------------------
+-- UI CREATION
+-----------------------------------
+local function createUI()
+    pcall(function()
+        if CoreGui:FindFirstChild("NoobTDHub") then CoreGui.NoobTDHub:Destroy() end
+        if LP.PlayerGui:FindFirstChild("NoobTDHub") then LP.PlayerGui.NoobTDHub:Destroy() end
+    end)
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "NoobTDHub"
+    gui.ResetOnSpawn = false
+    local success = pcall(function() gui.Parent = CoreGui end)
+    if not success then gui.Parent = LP.PlayerGui end
+
+    local main = Instance.new("Frame", gui)
+    main.Size = UDim2.new(0, 520, 0, 420)
+    main.Position = UDim2.new(0.5, -260, 0.5, -210)
+    main.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+    main.BorderSizePixel = 0
+    main.Active = true
+    main.Draggable = true
+    Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+    Instance.new("UIStroke", main).Color = Color3.fromRGB(80, 120, 255)
+
+    local title = Instance.new("TextLabel", main)
+    title.Size = UDim2.new(1, 0, 0, 30)
+    title.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.Text = " 🌟 Noob TD Lobby Hub V2"
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 14
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    Instance.new("UICorner", title).CornerRadius = UDim.new(0, 8)
+
+    local closeBtn = Instance.new("TextButton", title)
+    closeBtn.Size = UDim2.new(0, 30, 0, 30)
+    closeBtn.Position = UDim2.new(1, -30, 0, 0)
+    closeBtn.BackgroundTransparency = 1
+    closeBtn.Text = "✕"
+    closeBtn.TextColor3 = Color3.fromRGB(255, 80, 80)
+    closeBtn.TextSize = 16
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
+
+    local tabContainer = Instance.new("Frame", main)
+    tabContainer.Size = UDim2.new(1, 0, 0, 30)
+    tabContainer.Position = UDim2.new(0, 0, 0, 35)
+    tabContainer.BackgroundTransparency = 1
+
+    local contentContainer = Instance.new("Frame", main)
+    contentContainer.Size = UDim2.new(1, -20, 1, -80)
+    contentContainer.Position = UDim2.new(0, 10, 0, 70)
+    contentContainer.BackgroundTransparency = 1
+
+    local tabs = {}
+    local function createTabBtn(name, posIdx, total)
+        local btn = Instance.new("TextButton", tabContainer)
+        btn.Size = UDim2.new(1/total, -4, 1, 0)
+        btn.Position = UDim2.new((posIdx-1)/total, 2, 0, 0)
+        btn.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
+        btn.TextColor3 = Color3.fromRGB(200, 200, 200)
+        btn.Text = name
+        btn.Font = Enum.Font.GothamSemibold
+        btn.TextSize = 12
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+
+        local page = Instance.new("ScrollingFrame", contentContainer)
+        page.Size = UDim2.new(1, 0, 1, 0)
+        page.BackgroundTransparency = 1
+        page.ScrollBarThickness = 4
+        page.Visible = false
+        page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        
+        local layout = Instance.new("UIListLayout", page)
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+        layout.Padding = UDim.new(0, 5)
+
+        tabs[name] = {btn = btn, page = page}
+
+        btn.MouseButton1Click:Connect(function()
+            for k, v in pairs(tabs) do
+                v.page.Visible = (k == name)
+                v.btn.BackgroundColor3 = (k == name) and Color3.fromRGB(80, 120, 255) or Color3.fromRGB(40, 40, 55)
+                v.btn.TextColor3 = (k == name) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(200, 200, 200)
+            end
+        end)
+        return page
+    end
+
+    local pageSummon = createTabBtn("Summon & Sell", 1, 3)
+    local pageEnchant = createTabBtn("Auto Enchant", 2, 3)
+    local pageCrates = createTabBtn("BP Crates", 3, 3)
+
+    local order = 0
+    local function getOrder() order += 1 return order end
+
+    local function createCycler(parent, label, options, startIdx, callback)
+        local frame = Instance.new("Frame", parent)
+        frame.Size = UDim2.new(1, 0, 0, 30)
+        frame.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+        frame.LayoutOrder = getOrder()
+        Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 4)
+
+        local lbl = Instance.new("TextLabel", frame)
+        lbl.Size = UDim2.new(0.4, 0, 1, 0)
+        lbl.Position = UDim2.new(0, 10, 0, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = label
+        lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+        lbl.Font = Enum.Font.GothamSemibold
+        lbl.TextSize = 12
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+        local valLbl = Instance.new("TextLabel", frame)
+        valLbl.Size = UDim2.new(0.4, 0, 1, 0)
+        valLbl.Position = UDim2.new(0.5, 0, 0, 0)
+        valLbl.BackgroundTransparency = 1
+        valLbl.Text = options[startIdx] or "None"
+        valLbl.TextColor3 = Color3.fromRGB(80, 200, 255)
+        valLbl.Font = Enum.Font.GothamBold
+        valLbl.TextSize = 12
+
+        local btnL = Instance.new("TextButton", frame)
+        btnL.Size = UDim2.new(0, 24, 0, 24)
+        btnL.Position = UDim2.new(0.5, -30, 0.5, -12)
+        btnL.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
+        btnL.Text = "<"
+        btnL.TextColor3 = Color3.fromRGB(255,255,255)
+        Instance.new("UICorner", btnL).CornerRadius = UDim.new(0, 4)
+
+        local btnR = Instance.new("TextButton", frame)
+        btnR.Size = UDim2.new(0, 24, 0, 24)
+        btnR.Position = UDim2.new(0.9, 0, 0.5, -12)
+        btnR.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
+        btnR.Text = ">"
+        btnR.TextColor3 = Color3.fromRGB(255,255,255)
+        Instance.new("UICorner", btnR).CornerRadius = UDim.new(0, 4)
+
+        local idx = startIdx
+        local function update()
+            if #options == 0 then valLbl.Text = "None" return end
+            valLbl.Text = options[idx]
+            callback(idx, options[idx])
+        end
+
+        btnL.MouseButton1Click:Connect(function()
+            if #options == 0 then return end
+            idx = idx - 1
+            if idx < 1 then idx = #options end
+            update()
+        end)
+        btnR.MouseButton1Click:Connect(function()
+            if #options == 0 then return end
+            idx = idx + 1
+            if idx > #options then idx = 1 end
+            update()
+        end)
+    end
+
+    local function createToggle(parent, label, state, callback)
+        local btn = Instance.new("TextButton", parent)
+        btn.Size = UDim2.new(1, 0, 0, 30)
+        btn.BackgroundColor3 = state and Color3.fromRGB(40, 80, 40) or Color3.fromRGB(40, 30, 30)
+        btn.Text = "  " .. (state and "✅ " or "❌ ") .. label
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.Font = Enum.Font.GothamSemibold
+        btn.TextSize = 12
+        btn.TextXAlignment = Enum.TextXAlignment.Left
+        btn.LayoutOrder = getOrder()
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+
+        btn.MouseButton1Click:Connect(function()
+            state = not state
+            btn.BackgroundColor3 = state and Color3.fromRGB(40, 80, 40) or Color3.fromRGB(40, 30, 30)
+            btn.Text = "  " .. (state and "✅ " or "❌ ") .. label
+            callback(state)
+        end)
+    end
+
+    local function createDelayRow(parent, labelText, settingKey)
+        local row = Instance.new("Frame", parent)
+        row.Size = UDim2.new(1, 0, 0, 30)
+        row.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+        row.LayoutOrder = getOrder()
+        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 4)
+
+        local lbl = Instance.new("TextLabel", row)
+        lbl.Size = UDim2.new(0.5, 0, 1, 0)
+        lbl.Position = UDim2.new(0, 10, 0, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = labelText
+        lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+        lbl.Font = Enum.Font.GothamSemibold
+        lbl.TextSize = 12
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+        local box = Instance.new("TextBox", row)
+        box.Size = UDim2.new(0, 60, 0, 20)
+        box.Position = UDim2.new(1, -70, 0.5, -10)
+        box.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+        box.TextColor3 = Color3.fromRGB(255, 255, 255)
+        box.Text = tostring(S[settingKey])
+        box.Font = Enum.Font.Gotham
+        box.TextSize = 12
+        Instance.new("UICorner", box).CornerRadius = UDim.new(0, 4)
+
+        box.FocusLost:Connect(function()
+            local n = tonumber(box.Text)
+            if n then 
+                S[settingKey] = math.clamp(n, 0.05, 10)
+                box.Text = tostring(S[settingKey])
+                saveSettings()
+            else 
+                box.Text = tostring(S[settingKey]) 
+            end
+        end)
+    end
+
+    -- ==========================================
+    -- TAB 1: SUMMON & SELL
+    -- ==========================================
+    createCycler(pageSummon, "Select Banner:", availableBanners, S.SummonBannerIdx, function(idx, val)
+        S.SummonBannerIdx = idx
+        saveSettings()
+    end)
+
+    createCycler(pageSummon, "Summon Amount:", {"1x Summon", "10x Summon"}, S.SummonAmountIdx, function(idx, val)
+        S.SummonAmountIdx = idx
+        saveSettings()
+    end)
+
+    createDelayRow(pageSummon, "Summon Delay (s):", "SummonDelay")
+
+    createToggle(pageSummon, "Auto Summon & Sell", S.AutoSummon, function(state)
+        S.AutoSummon = state
+        saveSettings()
+    end)
+
+    local delLbl = Instance.new("TextLabel", pageSummon)
+    delLbl.Size = UDim2.new(1, 0, 0, 20)
+    delLbl.BackgroundTransparency = 1
+    delLbl.Text = "Auto Delete Settings (Select Rarities):"
+    delLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+    delLbl.Font = Enum.Font.GothamBold
+    delLbl.TextSize = 12
+    delLbl.LayoutOrder = getOrder()
+
+    local gridFrame = Instance.new("Frame", pageSummon)
+    gridFrame.Size = UDim2.new(1, 0, 0, 200)
+    gridFrame.BackgroundTransparency = 1
+    gridFrame.LayoutOrder = getOrder()
+    
+    local gl = Instance.new("UIGridLayout", gridFrame)
+    gl.CellSize = UDim2.new(0.48, 0, 0, 25)
+    gl.CellPadding = UDim2.new(0.04, 0, 0, 5)
+
+    for _, rarity in ipairs(raritiesList) do
+        -- Normal Toggle
+        local btnN = Instance.new("TextButton", gridFrame)
+        btnN.BackgroundColor3 = S.DeleteNormal[rarity] and Color3.fromRGB(150, 50, 50) or Color3.fromRGB(40, 40, 45)
+        btnN.Text = (S.DeleteNormal[rarity] and "🗑️ " or "") .. rarity .. " (Normal)"
+        btnN.TextColor3 = Color3.fromRGB(255,255,255)
+        btnN.Font = Enum.Font.Gotham
+        btnN.TextSize = 11
+        Instance.new("UICorner", btnN).CornerRadius = UDim.new(0, 4)
+        btnN.MouseButton1Click:Connect(function()
+            S.DeleteNormal[rarity] = not S.DeleteNormal[rarity]
+            btnN.BackgroundColor3 = S.DeleteNormal[rarity] and Color3.fromRGB(150, 50, 50) or Color3.fromRGB(40, 40, 45)
+            btnN.Text = (S.DeleteNormal[rarity] and "🗑️ " or "") .. rarity .. " (Normal)"
+            syncNativeAutoDelete(rarity, false, S.DeleteNormal[rarity])
+            saveSettings()
+        end)
+
+        -- Shiny Toggle
+        local btnS = Instance.new("TextButton", gridFrame)
+        btnS.BackgroundColor3 = S.DeleteShiny[rarity] and Color3.fromRGB(150, 50, 50) or Color3.fromRGB(40, 40, 45)
+        btnS.Text = (S.DeleteShiny[rarity] and "🗑️ " or "") .. rarity .. " (Shiny)"
+        btnS.TextColor3 = Color3.fromRGB(255,255,100)
+        btnS.Font = Enum.Font.Gotham
+        btnS.TextSize = 11
+        Instance.new("UICorner", btnS).CornerRadius = UDim.new(0, 4)
+        btnS.MouseButton1Click:Connect(function()
+            S.DeleteShiny[rarity] = not S.DeleteShiny[rarity]
+            btnS.BackgroundColor3 = S.DeleteShiny[rarity] and Color3.fromRGB(150, 50, 50) or Color3.fromRGB(40, 40, 45)
+            btnS.Text = (S.DeleteShiny[rarity] and "🗑️ " or "") .. rarity .. " (Shiny)"
+            syncNativeAutoDelete(rarity, true, S.DeleteShiny[rarity])
+            saveSettings()
+        end)
+    end
+
+    -- ==========================================
+    -- TAB 2: AUTO ENCHANT
+    -- ==========================================
+    local invRow = Instance.new("Frame", pageEnchant)
+    invRow.Size = UDim2.new(1, 0, 0, 150)
+    invRow.BackgroundTransparency = 1
+    invRow.LayoutOrder = getOrder()
+
+    local invScroll = Instance.new("ScrollingFrame", invRow)
+    invScroll.Size = UDim2.new(1, 0, 1, 0)
+    invScroll.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+    invScroll.ScrollBarThickness = 4
+    invScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    Instance.new("UICorner", invScroll).CornerRadius = UDim.new(0, 4)
+    local invLayout = Instance.new("UIListLayout", invScroll)
+    invLayout.Padding = UDim.new(0, 2)
+
+    local selLbl = Instance.new("TextLabel", pageEnchant)
+    selLbl.Size = UDim2.new(1, 0, 0, 20)
+    selLbl.BackgroundTransparency = 1
+    selLbl.Text = "Selected: " .. activeEnchantDisplay
+    selLbl.TextColor3 = Color3.fromRGB(80, 255, 120)
+    selLbl.Font = Enum.Font.GothamBold
+    selLbl.TextSize = 12
+    selLbl.LayoutOrder = getOrder()
+
+    local function renderInventory()
+        for _, v in ipairs(invScroll:GetChildren()) do
+            if v:IsA("TextButton") then v:Destroy() end
+        end
+        inventorySorted = getInventoryGroups()
+        for _, group in ipairs(inventorySorted) do
+            local b = Instance.new("TextButton", invScroll)
+            b.Size = UDim2.new(1, -8, 0, 25)
+            b.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+            b.TextColor3 = Color3.fromRGB(220, 220, 220)
+            b.Text = "  " .. group.display
+            b.Font = Enum.Font.GothamSemibold
+            b.TextSize = 11
+            b.TextXAlignment = Enum.TextXAlignment.Left
+            Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
+
+            b.MouseButton1Click:Connect(function()
+                activeEnchantUUID = group.uuids[1]
+                activeEnchantDisplay = group.rawDisplay
+                selLbl.Text = "Selected: " .. activeEnchantDisplay
+            end)
+        end
+    end
+    renderInventory()
+
+    local refBtn = Instance.new("TextButton", pageEnchant)
+    refBtn.Size = UDim2.new(1, 0, 0, 25)
+    refBtn.BackgroundColor3 = Color3.fromRGB(50, 100, 150)
+    refBtn.Text = "🔄 Refresh Inventory List"
+    refBtn.TextColor3 = Color3.fromRGB(255,255,255)
+    refBtn.Font = Enum.Font.GothamBold
+    refBtn.TextSize = 12
+    refBtn.LayoutOrder = getOrder()
+    Instance.new("UICorner", refBtn).CornerRadius = UDim.new(0, 4)
+    refBtn.MouseButton1Click:Connect(renderInventory)
+
+    createDelayRow(pageEnchant, "Enchant Delay (s):", "EnchantDelay")
+
+    createToggle(pageEnchant, "Enable Auto Enchant", S.AutoEnchant, function(state)
+        S.AutoEnchant = state
+        if state and not activeEnchantUUID then
+            print("[Macro] No tower selected! Please select a tower first.")
+            S.AutoEnchant = false
+            task.wait(0.1)
+            gui:Destroy()
+            createUI()
+        end
+        saveSettings()
+    end)
+
+    local enchLbl = Instance.new("TextLabel", pageEnchant)
+    enchLbl.Size = UDim2.new(1, 0, 0, 20)
+    enchLbl.BackgroundTransparency = 1
+    enchLbl.Text = "Target Enchants (Stop when rolled):"
+    enchLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+    enchLbl.Font = Enum.Font.GothamBold
+    enchLbl.TextSize = 12
+    enchLbl.LayoutOrder = getOrder()
+
+    local eGrid = Instance.new("Frame", pageEnchant)
+    eGrid.Size = UDim2.new(1, 0, 0, 300)
+    eGrid.BackgroundTransparency = 1
+    eGrid.LayoutOrder = getOrder()
+    
+    local egl = Instance.new("UIGridLayout", eGrid)
+    egl.CellSize = UDim2.new(0.31, 0, 0, 25)
+    egl.CellPadding = UDim2.new(0.02, 0, 0, 5)
+
+    for _, ench in ipairs(availableEnchants) do
+        local btnE = Instance.new("TextButton", eGrid)
+        btnE.BackgroundColor3 = S.TargetEnchants[ench] and Color3.fromRGB(50, 150, 50) or Color3.fromRGB(40, 40, 45)
+        btnE.Text = ench
+        btnE.TextColor3 = Color3.fromRGB(255,255,255)
+        btnE.Font = Enum.Font.Gotham
+        btnE.TextSize = 11
+        Instance.new("UICorner", btnE).CornerRadius = UDim.new(0, 4)
+        btnE.MouseButton1Click:Connect(function()
+            S.TargetEnchants[ench] = not S.TargetEnchants[ench]
+            btnE.BackgroundColor3 = S.TargetEnchants[ench] and Color3.fromRGB(50, 150, 50) or Color3.fromRGB(40, 40, 45)
+            saveSettings()
+        end)
+    end
+
+    -- ==========================================
+    -- TAB 3: BATTLEPASS CRATES
+    -- ==========================================
+    createDelayRow(pageCrates, "Buy Crate Delay (s):", "BuyCrateDelay")
+    createToggle(pageCrates, "Auto Buy BP Crate", S.AutoBuyCrate, function(state)
+        S.AutoBuyCrate = state
+        saveSettings()
+    end)
+    
+    createDelayRow(pageCrates, "Spin Crate Delay (s):", "SpinCrateDelay")
+    createToggle(pageCrates, "Auto Spin BP Crate", S.AutoSpinCrate, function(state)
+        S.AutoSpinCrate = state
+        saveSettings()
+    end)
+
+    -- Init Tabs
+    tabs["Summon & Sell"].btn.BackgroundColor3 = Color3.fromRGB(80, 120, 255)
+    tabs["Summon & Sell"].btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    tabs["Summon & Sell"].page.Visible = true
+end
+
+createUI()
+
+-----------------------------------
+-- MAIN LOOPS
+-----------------------------------
+
+-- 1. Auto Summon & Sell Loop
+task.spawn(function()
+    while true do
+        if S.AutoSummon then
+            local banner = availableBanners[S.SummonBannerIdx] or "Standard"
+            local amount = (S.SummonAmountIdx == 2) and 10 or 1
+
+            -- Fire Summon
+            local success, res = pcall(function()
+                return SummonRF:InvokeServer(amount, banner)
+            end)
+
+            if success and type(res) == "table" then
+                -- Fallback Manual Delete: We grab the exact UUIDs directly from the summon result
+                -- This guarantees it deletes the exact unit rolled, even if the native auto-delete fails.
+                for _, item in pairs(res) do
+                    if type(item) == "table" and item.uuid then
+                        local tData = TowersData.getTowerData(item.tower)
+                        if tData then
+                            local rarity = tData.Rarity
+                            local isShiny = item.shiny
+                            
+                            local shouldDelete = false
+                            if isShiny and S.DeleteShiny[rarity] then shouldDelete = true end
+                            if not isShiny and S.DeleteNormal[rarity] then shouldDelete = true end
+                            
+                            if shouldDelete then
+                                task.spawn(function()
+                                    pcall(function() DeleteUnitRF:InvokeServer(item.uuid) end)
+                                    pcall(function() DeleteUnitRF:InvokeServer({item.uuid}) end)
+                                end)
+                            end
+                        end
+                    end
+                end
+            end
+            task.wait(S.SummonDelay)
+        else
+            task.wait(0.5)
+        end
+    end
+end)
+
+-- 2. Smart Auto Enchant Loop
+task.spawn(function()
+    while true do
+        if S.AutoEnchant and activeEnchantUUID then
+            local tData = Constants.currentPlrData.Items.Towers[activeEnchantUUID]
+            
+            if not tData then
+                S.AutoEnchant = false
+                activeEnchantUUID = nil
+                print("[Macro] Tower lost. Auto Enchant stopped.")
+                createUI()
+            else
+                local currentEnchant = (tData.Mutations and tData.Mutations.Enchant) or "None"
+                
+                if S.TargetEnchants[currentEnchant] then
+                    -- Hit target! Stop immediately.
+                    S.AutoEnchant = false
+                    activeEnchantUUID = nil
+                    print("[Macro] Hit Target Enchant: " .. currentEnchant .. "! Stopping.")
+                    createUI()
+                else
+                    -- Fire the remote. InvokeServer yields until the server completes the enchant.
+                    local success, result = pcall(function() 
+                        return EnchantRF:InvokeServer(activeEnchantUUID) 
+                    end)
+                    
+                    if success then
+                        -- The server has finished processing. Check the new enchant.
+                        local newData = Constants.currentPlrData.Items.Towers[activeEnchantUUID]
+                        if newData then
+                            local newEnch = (newData.Mutations and newData.Mutations.Enchant) or "None"
+                            if S.TargetEnchants[newEnch] then
+                                S.AutoEnchant = false
+                                activeEnchantUUID = nil
+                                print("[Macro] Hit Target Enchant: " .. newEnch .. "! Stopping.")
+                                createUI()
+                            end
+                        end
+                    end
+                end
+            end
+            task.wait(S.EnchantDelay)
+        else
+            task.wait(0.1)
+        end
+    end
+end)
+
+-- 3. BattlePass Crates Loop
+task.spawn(function()
+    while true do
+        if S.AutoBuyCrate then
+            task.spawn(function() pcall(function() BuyCrateRF:InvokeServer() end) end)
+            task.wait(S.BuyCrateDelay)
+        else
+            task.wait(0.1)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        if S.AutoSpinCrate then
+            task.spawn(function() pcall(function() SpinCrateRF:InvokeServer() end) end)
+            task.wait(S.SpinCrateDelay)
+        else
+            task.wait(0.1)
+        end
+    end
+end)
+
+print("[Noob TD Lobby Hub V2] Loaded Successfully!")
