@@ -1,5 +1,5 @@
 -- =====================================================================
--- ⚔️ TOWER DEFENSE MACRO V29 (Source-Code Edition)
+-- ⚔️ TOWER DEFENSE MACRO V31 (Source-Code Edition)
 -- Built directly from the game's internal UI Handler dumps.
 -- Features:
 -- 1. Dynamic ID Resolver (Trade to alts, different slots = works perfectly)
@@ -7,7 +7,7 @@
 -- 3. Auto-Max Post-Macro Engine (Refinds and maxes all placed towers)
 -- 4. Smart Speed Selector (1x, 2x, 3x) - Legitimate Voting System
 -- 5. Auto Use Abilities - 100% Dynamic (Works on future new towers automatically)
--- 6. Discord Webhook - Beautiful match summary embeds (Win/Loss, Time, Gems, etc.)
+-- 6. Discord Webhook - Shows Total (+Earned) with strict anti-spam!
 -- =====================================================================
 
 if not game:IsLoaded() then game.Loaded:Wait() end
@@ -143,6 +143,7 @@ local InitSpeedEvent = Evts:WaitForChild("InitChangeSpeed")
 local SpeedEventVote = Evts:WaitForChild("VoteChangeSpeed")
 local ReplayEvent = Evts:WaitForChild("Replay")
 local ClientRemote = Evts:WaitForChild("Client_Remote")
+local UpdateCurrencies = Evts:WaitForChild("UpdateCurrencies")
 
 -- Game's Internal Data Modules
 local GameConstants = require(RS:WaitForChild("Modules"):WaitForChild("Data"):WaitForChild("Constants"))
@@ -208,9 +209,14 @@ local function extractID(tbl)
 end
 
 -- ==================== DISCORD WEBHOOK ====================
-local function sendWebhook()
+local lastWebhookTime = 0
+local function sendWebhook(rewardData)
     if not S.useWebhook or not S.webhookUrl or S.webhookUrl == "" then return end
     if not httprequest then addLog("❌ Executor doesn't support webhooks", C.Bad); return end
+    
+    -- Strict Debounce: Prevents duplicate sends for the same match (1 webhook per 20s per account)
+    if tick() - lastWebhookTime < 20 then return end
+    lastWebhookTime = tick()
 
     task.spawn(function()
         local isWin = false
@@ -236,23 +242,44 @@ local function sendWebhook()
         local level = "0"
         pcall(function() level = tostring(LP:FindFirstChild("Level").Value) end)
 
-        local coins = "0"
-        local gems = "0"
-        pcall(function() 
-            -- Scrape directly from the Game Over UI for 100% accuracy
-            local coinText = LP.PlayerGui.UI.Game.GameOver.Info.Currencies.Coins.Title.Text
-            local cleanCoin = coinText:gsub("<[^>]+>", "")
-            local matchCoin = cleanCoin:match("([%d%,]+)$")
-            if matchCoin then coins = matchCoin end
+        -- Get exact data from the server's packet
+        local earnedCoins = tonumber(rewardData.coinsEarned) or 0
+        local totalCoins = tonumber(rewardData.coins) or 0
+        local earnedGems = tonumber(rewardData.gems) or 0 -- The game uses .gems for the earned amount
+        local totalGems = 0
 
+        -- Fallback to UI Scraping just in case the server packet is weird
+        pcall(function() 
+            if totalCoins == 0 then
+                local coinText = LP.PlayerGui.UI.Game.GameOver.Info.Currencies.Coins.Title.Text
+                local cleanCoin = coinText:gsub("<[^>]+>", "")
+                local matchCoin = cleanCoin:match("([%d%,]+)$")
+                if matchCoin then totalCoins = tonumber(matchCoin:gsub(",", "")) or 0 end
+            end
+            
             local gemText = LP.PlayerGui.UI.Game.GameOver.Info.Currencies.Gems.Title.Text
             local cleanGem = gemText:gsub("<[^>]+>", "")
             local matchGem = cleanGem:match("([%d%,]+)$")
-            if matchGem then gems = matchGem end
+            if matchGem then totalGems = tonumber(matchGem:gsub(",", "")) or 0 end
         end)
 
+        -- Format numbers with commas
+        local function formatNum(n)
+            return tostring(n):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+        end
+
+        local coinsStr = formatNum(totalCoins)
+        if earnedCoins > 0 then
+            coinsStr = coinsStr .. " (+" .. formatNum(earnedCoins) .. ")"
+        end
+
+        local gemsStr = formatNum(totalGems)
+        if earnedGems > 0 then
+            gemsStr = gemsStr .. " (+" .. formatNum(earnedGems) .. ")"
+        end
+
         local data = {
-            username = "Tower Macro V29",
+            username = "Tower Macro V31",
             avatar_url = "https://i.imgur.com/AfFp7pu.png",
             embeds = {{
                 title = isWin and "🎉 Match Won!" or "💀 Match Lost!",
@@ -263,8 +290,8 @@ local function sendWebhook()
                     {name = "⏱️ Time", value = timeStr, inline = true},
                     {name = "👥 Players", value = tostring(players), inline = true},
                     {name = "⭐ Level", value = level, inline = true},
-                    {name = "💰 Coins", value = coins, inline = true},
-                    {name = "💎 Gems", value = gems, inline = true},
+                    {name = "💰 Total Coins", value = coinsStr, inline = true},
+                    {name = "💎 Total Gems", value = gemsStr, inline = true},
                 },
                 footer = {text = "Player: " .. LP.Name}
             }}
@@ -278,8 +305,19 @@ local function sendWebhook()
                 Body = HTTP:JSONEncode(data)
             })
         end)
+        addLog("🌐 Webhook Sent!", C.Blu)
     end)
 end
+
+-- Hook into the exact server remote that gives rewards
+UpdateCurrencies.OnClientEvent:Connect(function(data)
+    if type(data) == "table" then
+        task.spawn(function()
+            task.wait(1.5) -- Wait 1.5s to ensure Victory/Defeat UI title is fully updated
+            sendWebhook(data)
+        end)
+    end
+end)
 
 -- ==================== DYNAMIC ID RESOLVER ====================
 local function getDynamicTowerID(targetTowerName)
@@ -550,7 +588,7 @@ local tt = Instance.new("TextLabel", hdr)
 tt.Size = UDim2.new(1, -60, 1, 0); tt.Position = UDim2.new(0, 8, 0, 0)
 tt.BackgroundTransparency = 1; tt.TextColor3 = C.Tx; tt.TextSize = 10
 tt.Font = Enum.Font.GothamBlack; tt.TextXAlignment = Enum.TextXAlignment.Left
-tt.Text = "⚔ Tower Macro V29"
+tt.Text = "⚔ Tower Macro V31"
 
 local function hBtn(tx, pos, col)
     local b = Instance.new("TextButton", hdr)
@@ -947,9 +985,6 @@ task.spawn(function()
 
             if not S.gameEndHandled then
                 S.gameEndHandled = true
-                
-                -- Send Discord Webhook
-                sendWebhook()
 
                 if S.autoReplay then
                     addLog("🔄 Auto Replay in 4s...", C.Cyn)
@@ -990,4 +1025,4 @@ task.spawn(function()
     end
 end)
 
-addLog("⚔ Tower Macro V29 Ready", C.Ok)
+addLog("⚔ Tower Macro V31 Ready", C.Ok)
