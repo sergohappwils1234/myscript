@@ -1,10 +1,13 @@
 -- =====================================================================
--- ⚔️ TOWER DEFENSE MACRO V26 (Source-Code Edition)
+-- ⚔️ TOWER DEFENSE MACRO V29 (Source-Code Edition)
 -- Built directly from the game's internal UI Handler dumps.
 -- Features:
 -- 1. Dynamic ID Resolver (Trade to alts, different slots = works perfectly)
 -- 2. Strict Failure Tracking (Skips stolen spots, continues macro)
 -- 3. Auto-Max Post-Macro Engine (Refinds and maxes all placed towers)
+-- 4. Smart Speed Selector (1x, 2x, 3x) - Legitimate Voting System
+-- 5. Auto Use Abilities - 100% Dynamic (Works on future new towers automatically)
+-- 6. Discord Webhook - Beautiful match summary embeds (Win/Loss, Time, Gems, etc.)
 -- =====================================================================
 
 if not game:IsLoaded() then game.Loaded:Wait() end
@@ -16,6 +19,9 @@ local LP = Players.LocalPlayer or Players.PlayerAdded:Wait()
 local RS = game:GetService("ReplicatedStorage")
 local HTTP = game:GetService("HttpService")
 local UIS = game:GetService("UserInputService")
+
+-- Get HTTP Request function (Compatible with all major executors)
+local httprequest = (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request
 
 -- Anti-AFK
 local VU = game:GetService("VirtualUser")
@@ -46,8 +52,9 @@ local function loadJSON(path)
 end
 
 local DEFAULTS = {
-    autoReady = false, autoSkip = false, autoSpeed = false, 
-    autoReplay = false, autoPlay = false, autoMax = false, gamemode = "Extreme", macroName = ""
+    autoReady = false, autoSkip = false, autoSpeed = false, targetSpeed = 3,
+    autoReplay = false, autoPlay = false, autoMax = false, autoAbility = false, 
+    gamemode = "Extreme", macroName = "", useWebhook = false, webhookUrl = ""
 }
 local S = loadJSON(SETTINGS_FILE) or {}
 for k, v in pairs(DEFAULTS) do if S[k] == nil then S[k] = v end end
@@ -128,17 +135,36 @@ local Evts = Remotes:WaitForChild("Events")
 
 local PlaceTower = Funcs:WaitForChild("PlaceTower")
 local UpgradeTower = Funcs:WaitForChild("UpgradeTower")
+local TowerAbility = Funcs:WaitForChild("TowerAbility")
 local ReadyEvent = Evts:WaitForChild("Ready")
 local SkipEvent = Evts:WaitForChild("SkipWave")
 local GamemodeEvent = Evts:WaitForChild("Gamemode")
 local InitSpeedEvent = Evts:WaitForChild("InitChangeSpeed")
 local SpeedEventVote = Evts:WaitForChild("VoteChangeSpeed")
-local SpeedEventForce = Evts:WaitForChild("Change_Speed")
 local ReplayEvent = Evts:WaitForChild("Replay")
 local ClientRemote = Evts:WaitForChild("Client_Remote")
 
--- Game's Internal Data Module
+-- Game's Internal Data Modules
 local GameConstants = require(RS:WaitForChild("Modules"):WaitForChild("Data"):WaitForChild("Constants"))
+local TowersData = require(RS:WaitForChild("Modules"):WaitForChild("Data"):WaitForChild("Towers"))
+
+-- Cache all abilities in the game mapped to their tower names (100% Dynamic)
+local towerAbilitiesCache = {}
+pcall(function()
+    for _, tName in ipairs(TowersData.getTowerNames()) do
+        local tData = TowersData.getTowerData(tName)
+        if tData and tData.Levels then
+            for _, lvl in pairs(tData.Levels) do
+                if lvl.Stats and lvl.Stats.Ability then
+                    towerAbilitiesCache[tName] = towerAbilitiesCache[tName] or {}
+                    for _, ab in ipairs(lvl.Stats.Ability) do
+                        towerAbilitiesCache[tName][ab] = true
+                    end
+                end
+            end
+        end
+    end
+end)
 
 local function gCoins() return Coins.Value end
 local function gWave() return Values.Wave.Value end
@@ -181,6 +207,80 @@ local function extractID(tbl)
     return nil
 end
 
+-- ==================== DISCORD WEBHOOK ====================
+local function sendWebhook()
+    if not S.useWebhook or not S.webhookUrl or S.webhookUrl == "" then return end
+    if not httprequest then addLog("❌ Executor doesn't support webhooks", C.Bad); return end
+
+    task.spawn(function()
+        local isWin = false
+        pcall(function()
+            local title = LP.PlayerGui.UI.Game.GameOver.Victory.Title.Text
+            isWin = (title == "VICTORY!")
+        end)
+
+        local mapName = "Unknown"
+        pcall(function() mapName = Values.Map.Value end)
+
+        local gamemode = "Unknown"
+        pcall(function() gamemode = Values.Gamemode.Value end)
+
+        local timeTaken = 0
+        pcall(function() timeTaken = Values.ElapsedTime.Value end)
+        local mins = math.floor(timeTaken / 60)
+        local secs = timeTaken % 60
+        local timeStr = string.format("%02d:%02d", mins, secs)
+
+        local players = #Players:GetPlayers()
+
+        local level = "0"
+        pcall(function() level = tostring(LP:FindFirstChild("Level").Value) end)
+
+        local coins = "0"
+        local gems = "0"
+        pcall(function() 
+            -- Scrape directly from the Game Over UI for 100% accuracy
+            local coinText = LP.PlayerGui.UI.Game.GameOver.Info.Currencies.Coins.Title.Text
+            local cleanCoin = coinText:gsub("<[^>]+>", "")
+            local matchCoin = cleanCoin:match("([%d%,]+)$")
+            if matchCoin then coins = matchCoin end
+
+            local gemText = LP.PlayerGui.UI.Game.GameOver.Info.Currencies.Gems.Title.Text
+            local cleanGem = gemText:gsub("<[^>]+>", "")
+            local matchGem = cleanGem:match("([%d%,]+)$")
+            if matchGem then gems = matchGem end
+        end)
+
+        local data = {
+            username = "Tower Macro V29",
+            avatar_url = "https://i.imgur.com/AfFp7pu.png",
+            embeds = {{
+                title = isWin and "🎉 Match Won!" or "💀 Match Lost!",
+                color = isWin and 65280 or 16711680,
+                fields = {
+                    {name = "🗺️ Map", value = mapName, inline = true},
+                    {name = "⚙️ Gamemode", value = gamemode, inline = true},
+                    {name = "⏱️ Time", value = timeStr, inline = true},
+                    {name = "👥 Players", value = tostring(players), inline = true},
+                    {name = "⭐ Level", value = level, inline = true},
+                    {name = "💰 Coins", value = coins, inline = true},
+                    {name = "💎 Gems", value = gems, inline = true},
+                },
+                footer = {text = "Player: " .. LP.Name}
+            }}
+        }
+
+        pcall(function()
+            httprequest({
+                Url = S.webhookUrl,
+                Method = "POST",
+                Headers = {["Content-Type"] = "application/json"},
+                Body = HTTP:JSONEncode(data)
+            })
+        end)
+    end)
+end
+
 -- ==================== DYNAMIC ID RESOLVER ====================
 local function getDynamicTowerID(targetTowerName)
     local data = GameConstants.currentPlrData
@@ -198,12 +298,14 @@ end
 
 -- ==================== STRICT SERVER ID TRACKER ====================
 local myPlacedTowers = {}
+local myTowerNames = {}
 local failedPlacements = {}
 local myPlacedCount = 0
 local currentReplayPlacementOrder = nil
 
 local function resetTowerTracking()
     myPlacedTowers = {}
+    myTowerNames = {}
     failedPlacements = {}
     myPlacedCount = 0
     currentReplayPlacementOrder = nil
@@ -213,8 +315,10 @@ ClientRemote.OnClientEvent:Connect(function(funcName, data)
     if funcName == "PlaceTower" and type(data) == "table" then
         if data.O == LP.Name then
             myPlacedCount = myPlacedCount + 1
+            local tID = tostring(data.I)
+            myTowerNames[tID] = data.N
             if S.replaying and currentReplayPlacementOrder then
-                myPlacedTowers[currentReplayPlacementOrder] = tostring(data.I)
+                myPlacedTowers[currentReplayPlacementOrder] = tID
             end
         end
     end
@@ -314,7 +418,7 @@ local function doReplay(data, sL)
 
             local placePart = getPlaceablePart()
             local actualID = getDynamicTowerID(a.towerName) or a.towerID
-            local args = {[1] = {["towerID"] = actualID, ["towerToPlace"] = a.towerName, ["instance"] = placePart, ["position"] = Vector3.new(a.x, a.y, a.z)}}
+            local args = {[1] = {["towerID"] = actualID,["towerToPlace"] = a.towerName,["instance"] = placePart, ["position"] = Vector3.new(a.x, a.y, a.z)}}
 
             currentReplayPlacementOrder = a.placementOrder
             local preCount = myPlacedCount
@@ -429,7 +533,7 @@ end
 local gui = Instance.new("ScreenGui", LP.PlayerGui)
 gui.Name = "TowerMacroUI"; gui.ResetOnSpawn = false
 
-local mainH = 605
+local mainH = 685
 local main = Instance.new("Frame", gui)
 main.Size = UDim2.new(0, 260, 0, mainH); main.Position = UDim2.new(0, 20, 0.5, -mainH/2)
 main.BackgroundColor3 = C.Bg; main.BorderSizePixel = 0; main.Active = true
@@ -446,7 +550,7 @@ local tt = Instance.new("TextLabel", hdr)
 tt.Size = UDim2.new(1, -60, 1, 0); tt.Position = UDim2.new(0, 8, 0, 0)
 tt.BackgroundTransparency = 1; tt.TextColor3 = C.Tx; tt.TextSize = 10
 tt.Font = Enum.Font.GothamBlack; tt.TextXAlignment = Enum.TextXAlignment.Left
-tt.Text = "⚔ Tower Macro V26"
+tt.Text = "⚔ Tower Macro V29"
 
 local function hBtn(tx, pos, col)
     local b = Instance.new("TextButton", hdr)
@@ -556,12 +660,20 @@ sLbl.BackgroundTransparency = 1; sLbl.Text = "✅ Ready"; sLbl.TextColor3 = C.Ok
 sLbl.TextSize = 9; sLbl.Font = Enum.Font.GothamMedium; sLbl.TextXAlignment = Enum.TextXAlignment.Left
 
 -- AUTOMATION
-local aSec = mkS("AUTOMATION", 136)
+local aSec = mkS("AUTOMATION", 184)
 mkT(aSec, "Auto Ready", 13, "autoReady")
 mkT(aSec, "Auto Fast Skip", 37, "autoSkip")
-mkT(aSec, "Auto 2x Speed", 61, "autoSpeed")
-mkT(aSec, "Auto Replay Match", 85, "autoReplay")
-mkT(aSec, "Auto Max Towers", 109, "autoMax")
+mkT(aSec, "Auto Speed", 61, "autoSpeed")
+
+local SPEEDS = {"1x Speed", "2x Speed", "3x Speed"}
+local startSpdIdx = S.targetSpeed or 3
+mkCycler(aSec, SPEEDS, startSpdIdx, 85, function(idx, val)
+    S.targetSpeed = idx; saveS()
+end)
+
+mkT(aSec, "Auto Replay Match", 109, "autoReplay")
+mkT(aSec, "Auto Max Towers", 133, "autoMax")
+mkT(aSec, "Auto Use Abilities", 157, "autoAbility")
 
 -- GAMEMODE
 local gmSec = mkS("GAMEMODE", 40)
@@ -648,6 +760,20 @@ g_prevL.TextWrapped = true
 
 mkT(mSec, "Auto Play Macro", 140, "autoPlay")
 
+-- WEBHOOK
+local wSec = mkS("WEBHOOK", 64)
+mkT(wSec, "Enable Webhook", 13, "useWebhook")
+
+local wb = Instance.new("TextBox", wSec)
+wb.Size = UDim2.new(1, -8, 0, 16); wb.Position = UDim2.new(0, 4, 0, 37)
+wb.BackgroundColor3 = C.Bg; wb.Text = S.webhookUrl or ""
+wb.PlaceholderText = "https://discord.com/api/webhooks/..."; wb.TextColor3 = C.Acc
+wb.PlaceholderColor3 = C.Dim; wb.TextSize = 7; wb.Font = Enum.Font.GothamMedium
+wb.ClearTextOnFocus = false
+Instance.new("UICorner", wb).CornerRadius = UDim.new(0, 3)
+
+wb.FocusLost:Connect(function() S.webhookUrl = wb.Text; saveS() end)
+
 -- LOG
 local lSec = mkS("LOG", 145)
 mkB(lSec, "📋 DUMP", 0, 12, 0.48, 16, C.Sec, function() flushLog(); addLog("LOG → " .. LOG_FILE, C.Ok) end)
@@ -723,7 +849,6 @@ task.spawn(function()
             
             -- Reset speed tracker so it can trigger next game
             S.lastSpeedAttempt = 0
-            S.speedCap = 3
             
             resetTowerTracking()
             
@@ -758,48 +883,48 @@ task.spawn(function()
                 local currentSpeed = 1
                 pcall(function() currentSpeed = math.floor(Values.Speed.Value) end)
                 
-                local voteUI
-                pcall(function() voteUI = LP.PlayerGui.UI.Game:FindFirstChild("SpeedVote") end)
+                local target = S.targetSpeed or 3
                 
-                S.speedCap = S.speedCap or 3 -- Default assume max is 3x
-                
-                if voteUI and voteUI.Visible then
-                    local newSpeedText = ""
-                    local didIInitiate = false
+                if currentSpeed ~= target then
+                    local voteUI
+                    pcall(function() voteUI = LP.PlayerGui.UI.Game:FindFirstChild("SpeedVote") end)
                     
-                    pcall(function() 
-                        newSpeedText = voteUI.Container.Info.New.Text 
-                        didIInitiate = voteUI.Container.Info.Yes.Locked.Visible
-                    end)
-                    
-                    local newSpeed = tonumber(string.match(newSpeedText, "%d+")) or 0
-                    
-                    if newSpeed > currentSpeed then
-                        -- Genuine upgrade! Vote YES!
-                        if not didIInitiate and tick() - (S.lastVoteAttempt or 0) > 1.5 then
-                            S.lastVoteAttempt = tick()
-                            addLog("⚡ Voting YES for " .. newSpeedText .. " Speed", C.Cyn)
-                            pcall(function() SpeedEventVote:FireServer() end)
+                    if voteUI and voteUI.Visible then
+                        local newSpeedText = ""
+                        pcall(function() newSpeedText = voteUI.Container.Info.New.Text end)
+                        local newSpeed = tonumber(string.match(newSpeedText, "%d+")) or 0
+                        
+                        if newSpeed == target or (newSpeed > currentSpeed and target > currentSpeed) or (newSpeed < currentSpeed and target < currentSpeed) then
+                            if tick() - (S.lastVoteAttempt or 0) > 1.5 then
+                                S.lastVoteAttempt = tick()
+                                addLog("⚡ Voting YES for " .. newSpeed .. "x Speed", C.Cyn)
+                                pcall(function() SpeedEventVote:FireServer() end)
+                            end
+                        else
+                            -- Hide useless vote
+                            pcall(function() voteUI.Visible = false end)
                         end
                     else
-                        -- Useless or downgrade vote
-                        if didIInitiate then
-                            if S.speedCap > currentSpeed then
-                                S.speedCap = currentSpeed
-                                addLog("⚡ Speed capped at " .. S.speedCap .. "x for this account.", C.Dim)
-                            end
-                        end
-                        -- Hide the useless vote so it doesn't block us visually
-                        pcall(function() voteUI.Visible = false end)
-                    end
-                else
-                    -- Initiate vote if we are below our known cap
-                    if currentSpeed < S.speedCap then
                         if tick() - (S.lastSpeedAttempt or 0) > 5 then
                             S.lastSpeedAttempt = tick()
-                            addLog("⚡ Initiating Auto Speed...", C.Cyn)
-                            pcall(function() InitSpeedEvent:FireServer(1) end) 
-                            pcall(function() SpeedEventForce:FireServer(currentSpeed + 1) end)
+                            addLog("⚡ Initiating Vote for " .. target .. "x Speed...", C.Cyn)
+                            pcall(function() InitSpeedEvent:FireServer(target) end)
+                        end
+                    end
+                end
+            end
+
+            -- AUTO USE ABILITIES (100% Dynamic)
+            if S.autoAbility then
+                if tick() - (S.lastAbilityAttempt or 0) > 1 then
+                    S.lastAbilityAttempt = tick()
+                    for tID, tName in pairs(myTowerNames) do
+                        if towerAbilitiesCache[tName] then
+                            for abName in pairs(towerAbilitiesCache[tName]) do
+                                task.spawn(function()
+                                    pcall(function() TowerAbility:InvokeServer(tID, abName) end)
+                                end)
+                            end
                         end
                     end
                 end
@@ -820,16 +945,22 @@ task.spawn(function()
             S.readyFired = false
             S.macroPlayed = false
 
-            if S.autoReplay and not S.gameEndHandled then
+            if not S.gameEndHandled then
                 S.gameEndHandled = true
-                addLog("🔄 Auto Replay in 4s...", C.Cyn)
-                task.spawn(function()
-                    task.wait(4)
-                    if _G.__TOWER_MACRO then
-                        pcall(function() ReplayEvent:FireServer() end)
-                        addLog("🔄 Replay Fired", C.Ok)
-                    end
-                end)
+                
+                -- Send Discord Webhook
+                sendWebhook()
+
+                if S.autoReplay then
+                    addLog("🔄 Auto Replay in 4s...", C.Cyn)
+                    task.spawn(function()
+                        task.wait(4)
+                        if _G.__TOWER_MACRO then
+                            pcall(function() ReplayEvent:FireServer() end)
+                            addLog("🔄 Replay Fired", C.Ok)
+                        end
+                    end)
+                end
             end
         end
 
@@ -859,4 +990,4 @@ task.spawn(function()
     end
 end)
 
-addLog("⚔ Tower Macro V26 Ready", C.Ok)
+addLog("⚔ Tower Macro V29 Ready", C.Ok)
