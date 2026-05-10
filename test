@@ -1,13 +1,13 @@
 -- =====================================================================
--- ⚔️ TOWER DEFENSE MACRO V31 (Source-Code Edition)
+-- ⚔️ TOWER DEFENSE MACRO V32 (Source-Code Edition)
 -- Built directly from the game's internal UI Handler dumps.
 -- Features:
 -- 1. Dynamic ID Resolver (Trade to alts, different slots = works perfectly)
 -- 2. Strict Failure Tracking (Skips stolen spots, continues macro)
 -- 3. Auto-Max Post-Macro Engine (Refinds and maxes all placed towers)
--- 4. Smart Speed Selector (1x, 2x, 3x) - Legitimate Voting System
+-- 4. Smart Speed Selector (Falls back to 2x if 3x gamepass is not owned)
 -- 5. Auto Use Abilities - 100% Dynamic (Works on future new towers automatically)
--- 6. Discord Webhook - Shows Total (+Earned) with strict anti-spam!
+-- 6. Discord Webhook - Real-World Timer & Strict Anti-Spam
 -- =====================================================================
 
 if not game:IsLoaded() then game.Loaded:Wait() end
@@ -61,6 +61,10 @@ for k, v in pairs(DEFAULTS) do if S[k] == nil then S[k] = v end end
 
 S.recording = false; S.replaying = false; S.macro = nil
 S.macroPlayed = false; S.gameEndHandled = false; S.readyFired = false
+
+-- Real-World Timer Variables
+local matchStartTime = nil
+local matchEndTime = nil
 
 local function saveS()
     local t = {}; for k in pairs(DEFAULTS) do t[k] = S[k] end
@@ -231,11 +235,25 @@ local function sendWebhook(rewardData)
         local gamemode = "Unknown"
         pcall(function() gamemode = Values.Gamemode.Value end)
 
-        local timeTaken = 0
-        pcall(function() timeTaken = Values.ElapsedTime.Value end)
-        local mins = math.floor(timeTaken / 60)
-        local secs = timeTaken % 60
-        local timeStr = string.format("%02d:%02d", mins, secs)
+        -- In-Game Time
+        local inGameTime = 0
+        pcall(function() inGameTime = Values.ElapsedTime.Value end)
+        local igMins = math.floor(inGameTime / 60)
+        local igSecs = inGameTime % 60
+        local inGameTimeStr = string.format("%02d:%02d", igMins, igSecs)
+
+        -- Real World Time
+        local realTimeTaken = 0
+        if matchStartTime and matchEndTime then
+            realTimeTaken = matchEndTime - matchStartTime
+        elseif matchStartTime then
+            realTimeTaken = tick() - matchStartTime
+        end
+        local rMins = math.floor(realTimeTaken / 60)
+        local rSecs = math.floor(realTimeTaken % 60)
+        local realTimeStr = string.format("%02d:%02d", rMins, rSecs)
+
+        local finalTimeStr = realTimeStr .. " (In-Game: " .. inGameTimeStr .. ")"
 
         local players = #Players:GetPlayers()
 
@@ -245,7 +263,7 @@ local function sendWebhook(rewardData)
         -- Get exact data from the server's packet
         local earnedCoins = tonumber(rewardData.coinsEarned) or 0
         local totalCoins = tonumber(rewardData.coins) or 0
-        local earnedGems = tonumber(rewardData.gems) or 0 -- The game uses .gems for the earned amount
+        local earnedGems = tonumber(rewardData.gems) or 0 
         local totalGems = 0
 
         -- Fallback to UI Scraping just in case the server packet is weird
@@ -279,7 +297,7 @@ local function sendWebhook(rewardData)
         end
 
         local data = {
-            username = "Tower Macro V31",
+            username = "Tower Macro V32",
             avatar_url = "https://i.imgur.com/AfFp7pu.png",
             embeds = {{
                 title = isWin and "🎉 Match Won!" or "💀 Match Lost!",
@@ -287,7 +305,7 @@ local function sendWebhook(rewardData)
                 fields = {
                     {name = "🗺️ Map", value = mapName, inline = true},
                     {name = "⚙️ Gamemode", value = gamemode, inline = true},
-                    {name = "⏱️ Time", value = timeStr, inline = true},
+                    {name = "⏱️ Real Time", value = finalTimeStr, inline = true},
                     {name = "👥 Players", value = tostring(players), inline = true},
                     {name = "⭐ Level", value = level, inline = true},
                     {name = "💰 Total Coins", value = coinsStr, inline = true},
@@ -588,7 +606,7 @@ local tt = Instance.new("TextLabel", hdr)
 tt.Size = UDim2.new(1, -60, 1, 0); tt.Position = UDim2.new(0, 8, 0, 0)
 tt.BackgroundTransparency = 1; tt.TextColor3 = C.Tx; tt.TextSize = 10
 tt.Font = Enum.Font.GothamBlack; tt.TextXAlignment = Enum.TextXAlignment.Left
-tt.Text = "⚔ Tower Macro V31"
+tt.Text = "⚔ Tower Macro V32"
 
 local function hBtn(tx, pos, col)
     local b = Instance.new("TextButton", hdr)
@@ -885,8 +903,10 @@ task.spawn(function()
             S.macroPlayed = false
             S.gameEndHandled = false
             
-            -- Reset speed tracker so it can trigger next game
+            -- Reset speed tracker & Real World Timer
             S.lastSpeedAttempt = 0
+            matchStartTime = nil
+            matchEndTime = nil
             
             resetTowerTracking()
             
@@ -915,6 +935,10 @@ task.spawn(function()
         elseif gr then
             S.readyFired = false
             S.gameEndHandled = false
+            
+            -- Track Real World Time
+            if not matchStartTime then matchStartTime = tick() end
+            matchEndTime = nil
 
             -- ROBUST SPEED CHECK: Smart Auto-Speed & Anti-Downgrade
             if S.autoSpeed then
@@ -922,6 +946,13 @@ task.spawn(function()
                 pcall(function() currentSpeed = math.floor(Values.Speed.Value) end)
                 
                 local target = S.targetSpeed or 3
+                
+                -- Smart 3x Gamepass Check
+                local is3xLocked = false
+                pcall(function() is3xLocked = LP.PlayerGui.UI.Game.Frames.GameSpeed.Container.Info.Speeds["3"].Locked.Visible end)
+                if target == 3 and is3xLocked then
+                    target = 2 -- Fallback to 2x if 3x is locked
+                end
                 
                 if currentSpeed ~= target then
                     local voteUI
@@ -982,6 +1013,9 @@ task.spawn(function()
         elseif isGameOver then
             S.readyFired = false
             S.macroPlayed = false
+            
+            -- Stop Real World Timer
+            if matchStartTime and not matchEndTime then matchEndTime = tick() end
 
             if not S.gameEndHandled then
                 S.gameEndHandled = true
@@ -1025,4 +1059,4 @@ task.spawn(function()
     end
 end)
 
-addLog("⚔ Tower Macro V31 Ready", C.Ok)
+addLog("⚔ Tower Macro V32 Ready", C.Ok)
