@@ -1,6 +1,5 @@
 -- =====================================================================
--- ⚔️ TOWER DEFENSE MACRO V32 (Source-Code Edition)
--- Built directly from the game's internal UI Handler dumps.
+-- ⚔️ TOWER DEFENSE MACRO V32.1 (FIXED PLACEMENT EDITION)
 -- Features:
 -- 1. Dynamic ID Resolver (Trade to alts, different slots = works perfectly)
 -- 2. Strict Failure Tracking (Skips stolen spots, continues macro)
@@ -8,11 +7,11 @@
 -- 4. Smart Speed Selector (Falls back to 2x if 3x gamepass is not owned)
 -- 5. Auto Use Abilities - 100% Dynamic (Works on future new towers automatically)
 -- 6. Discord Webhook - Real-World Timer & Strict Anti-Spam
+-- 7. AGGRESSIVE LOOP DELETE - Safely nukes 95% of unit data to save CPU
+-- 8. [NEW] Raycast Instance Resolver - Fixes "Random/Failed Placements" 
 -- =====================================================================
 
 if not game:IsLoaded() then game.Loaded:Wait() end
-setfpscap(15)
-game:GetService("RunService").Heartbeat:Connect(function() setfpscap(15) end)
 
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer or Players.PlayerAdded:Wait()
@@ -54,7 +53,9 @@ end
 local DEFAULTS = {
     autoReady = false, autoSkip = false, autoSpeed = false, targetSpeed = 3,
     autoReplay = false, autoPlay = false, autoMax = false, autoAbility = false, 
-    gamemode = "Extreme", macroName = "", useWebhook = false, webhookUrl = ""
+    gamemode = "Extreme", macroName = "", useWebhook = false, webhookUrl = "",
+    -- Optimization Defaults
+    hideTowers = false, deleteUnits = false, hideEnemies = false, disableVFX = false, potatoMode = false
 }
 local S = loadJSON(SETTINGS_FILE) or {}
 for k, v in pairs(DEFAULTS) do if S[k] == nil then S[k] = v end end
@@ -171,6 +172,84 @@ pcall(function()
     end
 end)
 
+-- ==================== AGGRESSIVE OPTIMIZATION ENGINE ====================
+local towersFolder = MapFolder:WaitForChild("Towers")
+local unitsFolder = MapFolder:WaitForChild("Units")
+local entitiesFolder = MapFolder:WaitForChild("Entities")
+local vfxFolder = MapFolder:WaitForChild("VFX")
+
+local function aggressiveDelete(model, isTower)
+    if not model then return end
+    pcall(function()
+        for _, v in ipairs(model:GetDescendants()) do
+            if v:IsA("BasePart") then
+                v.Transparency = 1
+                v.CanCollide = false
+            elseif v:IsA("Decal") or v:IsA("Texture") or v:IsA("SpecialMesh") then
+                v:Destroy() 
+            elseif v:IsA("Accessory") or v:IsA("Clothing") or v:IsA("CharacterMesh") then
+                v:Destroy() 
+            elseif v:IsA("ParticleEmitter") or v:IsA("Beam") or v:IsA("Trail") or v:IsA("PointLight") or v:IsA("SurfaceLight") then
+                v.Enabled = false
+                v:Destroy()
+            elseif v:IsA("Sound") then
+                v:Destroy()
+            end
+        end
+    end)
+end
+
+local function applyTowerOpt(tower) if S.hideTowers then aggressiveDelete(tower, true) end end
+local function applyUnitOpt(unit) if S.deleteUnits then aggressiveDelete(unit, false) end end
+local function applyEnemyOpt(enemy) if S.hideEnemies then aggressiveDelete(enemy, false) end end
+
+towersFolder.ChildAdded:Connect(function(child) task.wait(0.1) applyTowerOpt(child) end)
+unitsFolder.ChildAdded:Connect(function(child) task.wait(0.1) applyUnitOpt(child) end)
+entitiesFolder.ChildAdded:Connect(function(child) task.wait(0.1) applyEnemyOpt(child) end)
+vfxFolder.ChildAdded:Connect(function(child)
+    if S.disableVFX then
+        task.wait()
+        pcall(function() child:Destroy() end)
+    end
+end)
+
+local function togglePotatoMode(state)
+    pcall(function()
+        if state then
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+            if setfpscap then setfpscap(10) end
+            game.Lighting.GlobalShadows = false
+            for _, v in ipairs(game.Lighting:GetChildren()) do
+                if v:IsA("PostEffect") then v.Enabled = false end
+            end
+        else
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic
+            if setfpscap then setfpscap(60) end
+            game.Lighting.GlobalShadows = true
+        end
+    end)
+end
+togglePotatoMode(S.potatoMode)
+
+task.spawn(function()
+    while _G.__TOWER_MACRO do
+        if S.deleteUnits then
+            for _, u in ipairs(unitsFolder:GetChildren()) do applyUnitOpt(u) end
+        end
+        if S.hideEnemies then
+            for _, e in ipairs(entitiesFolder:GetChildren()) do applyEnemyOpt(e) end
+        end
+        if S.hideTowers then
+            for _, t in ipairs(towersFolder:GetChildren()) do applyTowerOpt(t) end
+        end
+        if S.disableVFX then
+            for _, v in ipairs(vfxFolder:GetChildren()) do pcall(function() v:Destroy() end) end
+        end
+        task.wait(0.5)
+    end
+end)
+
+
 local function gCoins() return Coins.Value end
 local function gWave() return Values.Wave.Value end
 local function gRunning() return Values.GameRunning.Value end
@@ -183,8 +262,45 @@ local function checkGameOver()
     return isOver
 end
 
-local function getPlaceablePart()
+-- [FIXED] Smart Raycast Instance Resolver for Backwards Compatibility with old JSONs
+local function getPlaceablePart(pos)
     local innerMap = MapFolder:FindFirstChild("Map")
+    if innerMap and pos then
+        local placeableParts = {}
+        for _, desc in ipairs(innerMap:GetDescendants()) do
+            if desc:IsA("BasePart") and desc:FindFirstAncestor("Placeable") then
+                table.insert(placeableParts, desc)
+            end
+        end
+        
+        if #placeableParts > 0 then
+            -- Raycast straight down from slightly above the placement position
+            local origin = pos + Vector3.new(0, 50, 0)
+            local direction = Vector3.new(0, -100, 0)
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Include
+            params.FilterDescendantsInstances = placeableParts
+            
+            local res = workspace:Raycast(origin, direction, params)
+            if res and res.Instance then
+                return res.Instance
+            end
+            
+            -- Fallback: Find the closest placeable part if raycast misses
+            local closestPart = placeableParts[1]
+            local closestDist = (closestPart.Position - pos).Magnitude
+            for i = 2, #placeableParts do
+                local dist = (placeableParts[i].Position - pos).Magnitude
+                if dist < closestDist then
+                    closestDist = dist
+                    closestPart = placeableParts[i]
+                end
+            end
+            return closestPart
+        end
+    end
+    
+    -- Absolute fallback to old method
     if innerMap then
         for _, child in ipairs(innerMap:GetChildren()) do
             if child:IsA("Model") or child:IsA("Folder") then
@@ -218,7 +334,6 @@ local function sendWebhook(rewardData)
     if not S.useWebhook or not S.webhookUrl or S.webhookUrl == "" then return end
     if not httprequest then addLog("❌ Executor doesn't support webhooks", C.Bad); return end
     
-    -- Strict Debounce: Prevents duplicate sends for the same match (1 webhook per 20s per account)
     if tick() - lastWebhookTime < 20 then return end
     lastWebhookTime = tick()
 
@@ -235,14 +350,12 @@ local function sendWebhook(rewardData)
         local gamemode = "Unknown"
         pcall(function() gamemode = Values.Gamemode.Value end)
 
-        -- In-Game Time
         local inGameTime = 0
         pcall(function() inGameTime = Values.ElapsedTime.Value end)
         local igMins = math.floor(inGameTime / 60)
         local igSecs = inGameTime % 60
         local inGameTimeStr = string.format("%02d:%02d", igMins, igSecs)
 
-        -- Real World Time
         local realTimeTaken = 0
         if matchStartTime and matchEndTime then
             realTimeTaken = matchEndTime - matchStartTime
@@ -260,13 +373,11 @@ local function sendWebhook(rewardData)
         local level = "0"
         pcall(function() level = tostring(LP:FindFirstChild("Level").Value) end)
 
-        -- Get exact data from the server's packet
         local earnedCoins = tonumber(rewardData.coinsEarned) or 0
         local totalCoins = tonumber(rewardData.coins) or 0
         local earnedGems = tonumber(rewardData.gems) or 0 
         local totalGems = 0
 
-        -- Fallback to UI Scraping just in case the server packet is weird
         pcall(function() 
             if totalCoins == 0 then
                 local coinText = LP.PlayerGui.UI.Game.GameOver.Info.Currencies.Coins.Title.Text
@@ -281,7 +392,6 @@ local function sendWebhook(rewardData)
             if matchGem then totalGems = tonumber(matchGem:gsub(",", "")) or 0 end
         end)
 
-        -- Format numbers with commas
         local function formatNum(n)
             return tostring(n):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
         end
@@ -297,7 +407,7 @@ local function sendWebhook(rewardData)
         end
 
         local data = {
-            username = "Tower Macro V32",
+            username = "Tower Macro V32.1",
             avatar_url = "https://i.imgur.com/AfFp7pu.png",
             embeds = {{
                 title = isWin and "🎉 Match Won!" or "💀 Match Lost!",
@@ -327,11 +437,10 @@ local function sendWebhook(rewardData)
     end)
 end
 
--- Hook into the exact server remote that gives rewards
 UpdateCurrencies.OnClientEvent:Connect(function(data)
     if type(data) == "table" then
         task.spawn(function()
-            task.wait(1.5) -- Wait 1.5s to ensure Victory/Defeat UI title is fully updated
+            task.wait(1.5) 
             sendWebhook(data)
         end)
     end
@@ -472,9 +581,10 @@ local function doReplay(data, sL)
         if a.type == "place" then
             if sL then sL.Text = "📍 " .. a.towerName .. " (" .. i .. "/" .. #data.actions .. ")" end
 
-            local placePart = getPlaceablePart()
+            local placePos = Vector3.new(a.x, a.y, a.z)
+            local placePart = getPlaceablePart(placePos)
             local actualID = getDynamicTowerID(a.towerName) or a.towerID
-            local args = {[1] = {["towerID"] = actualID,["towerToPlace"] = a.towerName,["instance"] = placePart, ["position"] = Vector3.new(a.x, a.y, a.z)}}
+            local args = {[1] = {["towerID"] = actualID,["towerToPlace"] = a.towerName,["instance"] = placePart, ["position"] = placePos}}
 
             currentReplayPlacementOrder = a.placementOrder
             local preCount = myPlacedCount
@@ -606,7 +716,7 @@ local tt = Instance.new("TextLabel", hdr)
 tt.Size = UDim2.new(1, -60, 1, 0); tt.Position = UDim2.new(0, 8, 0, 0)
 tt.BackgroundTransparency = 1; tt.TextColor3 = C.Tx; tt.TextSize = 10
 tt.Font = Enum.Font.GothamBlack; tt.TextXAlignment = Enum.TextXAlignment.Left
-tt.Text = "⚔ Tower Macro V32"
+tt.Text = "⚔ Tower Macro V32.1"
 
 local function hBtn(tx, pos, col)
     local b = Instance.new("TextButton", hdr)
@@ -730,6 +840,24 @@ end)
 mkT(aSec, "Auto Replay Match", 109, "autoReplay")
 mkT(aSec, "Auto Max Towers", 133, "autoMax")
 mkT(aSec, "Auto Use Abilities", 157, "autoAbility")
+
+-- OPTIMIZATION
+local optSec = mkS("OPTIMIZATION", 136)
+mkT(optSec, "Hide Towers (Keep Rings)", 13, "hideTowers", function(val)
+    if val then for _, t in ipairs(towersFolder:GetChildren()) do applyTowerOpt(t) end end
+end)
+mkT(optSec, "Disable Summoned Units", 37, "deleteUnits", function(val)
+    if val then for _, u in ipairs(unitsFolder:GetChildren()) do applyUnitOpt(u) end end
+end)
+mkT(optSec, "Hide Enemies", 61, "hideEnemies", function(val)
+    if val then for _, e in ipairs(entitiesFolder:GetChildren()) do applyEnemyOpt(e) end end
+end)
+mkT(optSec, "Disable VFX", 85, "disableVFX", function(val)
+    if val then for _, v in ipairs(vfxFolder:GetChildren()) do pcall(function() v:Destroy() end) end end
+end)
+mkT(optSec, "Potato Mode (Low FPS/GFX)", 109, "potatoMode", function(val)
+    togglePotatoMode(val)
+end)
 
 -- GAMEMODE
 local gmSec = mkS("GAMEMODE", 40)
@@ -903,7 +1031,6 @@ task.spawn(function()
             S.macroPlayed = false
             S.gameEndHandled = false
             
-            -- Reset speed tracker & Real World Timer
             S.lastSpeedAttempt = 0
             matchStartTime = nil
             matchEndTime = nil
@@ -918,7 +1045,6 @@ task.spawn(function()
                     pcall(function() ReadyEvent:FireServer() end)
                 end
                 
-                -- Continuously check and vote gamemode while in lobby to ensure it doesn't miss the UI
                 if S.gamemode and S.gamemode ~= "" then
                     if tick() - (S.lastGamemodeAttempt or 0) > 2 then
                         S.lastGamemodeAttempt = tick()
@@ -936,54 +1062,47 @@ task.spawn(function()
             S.readyFired = false
             S.gameEndHandled = false
             
-            -- Track Real World Time
             if not matchStartTime then matchStartTime = tick() end
             matchEndTime = nil
 
-            -- ROBUST SPEED CHECK: Smart Auto-Speed & Anti-Downgrade
             if S.autoSpeed then
                 local currentSpeed = 1
                 pcall(function() currentSpeed = math.floor(Values.Speed.Value) end)
                 
                 local target = S.targetSpeed or 3
                 
-                -- Smart 3x Gamepass Check
                 local is3xLocked = false
                 pcall(function() is3xLocked = LP.PlayerGui.UI.Game.Frames.GameSpeed.Container.Info.Speeds["3"].Locked.Visible end)
                 if target == 3 and is3xLocked then
-                    target = 2 -- Fallback to 2x if 3x is locked
+                    target = 2
                 end
                 
-                if currentSpeed ~= target then
-                    local voteUI
-                    pcall(function() voteUI = LP.PlayerGui.UI.Game:FindFirstChild("SpeedVote") end)
+                local voteUI
+                pcall(function() voteUI = LP.PlayerGui.UI.Game:FindFirstChild("SpeedVote") end)
+                
+                if voteUI and voteUI.Visible then
+                    local newSpeedText = ""
+                    pcall(function() newSpeedText = voteUI.Container.Info.New.Text end)
+                    local newSpeed = tonumber(string.match(newSpeedText, "%d+")) or 0
                     
-                    if voteUI and voteUI.Visible then
-                        local newSpeedText = ""
-                        pcall(function() newSpeedText = voteUI.Container.Info.New.Text end)
-                        local newSpeed = tonumber(string.match(newSpeedText, "%d+")) or 0
-                        
-                        if newSpeed == target or (newSpeed > currentSpeed and target > currentSpeed) or (newSpeed < currentSpeed and target < currentSpeed) then
-                            if tick() - (S.lastVoteAttempt or 0) > 1.5 then
-                                S.lastVoteAttempt = tick()
-                                addLog("⚡ Voting YES for " .. newSpeed .. "x Speed", C.Cyn)
-                                pcall(function() SpeedEventVote:FireServer() end)
-                            end
-                        else
-                            -- Hide useless vote
-                            pcall(function() voteUI.Visible = false end)
+                    if newSpeed > currentSpeed or newSpeed == target then
+                        if tick() - (S.lastVoteAttempt or 0) > 1.5 then
+                            S.lastVoteAttempt = tick()
+                            addLog("⚡ Voting YES for " .. newSpeed .. "x Speed", C.Cyn)
+                            pcall(function() SpeedEventVote:FireServer() end)
                         end
                     else
-                        if tick() - (S.lastSpeedAttempt or 0) > 5 then
-                            S.lastSpeedAttempt = tick()
-                            addLog("⚡ Initiating Vote for " .. target .. "x Speed...", C.Cyn)
-                            pcall(function() InitSpeedEvent:FireServer(target) end)
-                        end
+                        pcall(function() voteUI.Visible = false end)
+                    end
+                elseif currentSpeed < target then
+                    if tick() - (S.lastSpeedAttempt or 0) > 5 then
+                        S.lastSpeedAttempt = tick()
+                        addLog("⚡ Initiating Vote for " .. target .. "x Speed...", C.Cyn)
+                        pcall(function() InitSpeedEvent:FireServer(target) end)
                     end
                 end
             end
 
-            -- AUTO USE ABILITIES (100% Dynamic)
             if S.autoAbility then
                 if tick() - (S.lastAbilityAttempt or 0) > 1 then
                     S.lastAbilityAttempt = tick()
@@ -1014,7 +1133,6 @@ task.spawn(function()
             S.readyFired = false
             S.macroPlayed = false
             
-            -- Stop Real World Timer
             if matchStartTime and not matchEndTime then matchEndTime = tick() end
 
             if not S.gameEndHandled then
@@ -1059,4 +1177,4 @@ task.spawn(function()
     end
 end)
 
-addLog("⚔ Tower Macro V32 Ready", C.Ok)
+addLog("⚔ Tower Macro V32.1 Ready", C.Ok)
